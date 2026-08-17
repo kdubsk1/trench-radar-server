@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v1.4
+// Trench Radar — shared calls server v1.5
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -43,6 +43,22 @@ function memStore() {
       return sort === 'recent' ? rows.sort((a, b) => b.t - a.t) : rows.sort((a, b) => (b.peakPct ?? -1e9) - (a.peakPct ?? -1e9));
     },
     async ingest(user, kind, payload) { this._ingested = (this._ingested || 0) + 1; },
+    async walletsPut(entries) {
+      this._wal = this._wal || new Map();
+      let n = 0;
+      for (const [mint, d] of Object.entries(entries)) {
+        const ex = this._wal.get(mint);
+        if (!ex || (d.t || 0) > (ex.t || 0)) { this._wal.set(mint, d); n++; }
+      }
+      return n;
+    },
+    async walletsGet(sinceMs, limit) {
+      this._wal = this._wal || new Map();
+      const out = {};
+      const rows = [...this._wal.entries()].filter(([, d]) => (d.t || 0) >= sinceMs).sort((a, b) => (b[1].t || 0) - (a[1].t || 0));
+      for (const [m, d] of rows.slice(0, limit)) out[m] = d;
+      return out;
+    },
     async intelPut(entries) {
       this._intel = this._intel || new Map();
       let n = 0;
@@ -93,6 +109,10 @@ function pgStore() {
         mint TEXT PRIMARY KEY, t BIGINT NOT NULL, data JSONB NOT NULL
       )`);
       await pool.query('CREATE INDEX IF NOT EXISTS intel_t_idx ON intel(t)');
+      await pool.query(`CREATE TABLE IF NOT EXISTS wallets (
+        mint TEXT PRIMARY KEY, t BIGINT NOT NULL, data JSONB NOT NULL
+      )`);
+      await pool.query('CREATE INDEX IF NOT EXISTS wallets_t_idx ON wallets(t)');
     },
     async upsertCall(c) {
       await pool.query(
@@ -126,6 +146,25 @@ function pgStore() {
     async ingest(user, kind, payload) {
       await pool.query('INSERT INTO sessions (usr, kind, t, payload) VALUES ($1,$2,$3,$4)',
         [user, kind || 'auto', Date.now(), JSON.stringify(payload)]);
+    },
+    async walletsPut(entries) {
+      let n = 0;
+      for (const [mint, d] of Object.entries(entries)) {
+        const r = await pool.query(
+          `INSERT INTO wallets (mint, t, data) VALUES ($1,$2,$3)
+           ON CONFLICT (mint) DO UPDATE SET t = EXCLUDED.t, data = EXCLUDED.data
+           WHERE wallets.t < EXCLUDED.t`,
+          [String(mint).slice(0, 48), d.t || Date.now(), JSON.stringify(d)]
+        );
+        n += r.rowCount;
+      }
+      return n;
+    },
+    async walletsGet(sinceMs, limit) {
+      const r = await pool.query('SELECT mint, data FROM wallets WHERE t >= $1 ORDER BY t DESC LIMIT $2', [sinceMs, limit]);
+      const out = {};
+      for (const row of r.rows) out[row.mint] = row.data;
+      return out;
     },
     async intelPut(entries) {
       let n = 0;
@@ -230,7 +269,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.4' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.5' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -247,6 +286,14 @@ const server = http.createServer(async (req, res) => {
         window: u.searchParams.get('window') || '24h', sort,
         wins: wl.w, losses: wl.l, total: all.length, coins: all.slice(0, limit),
       });
+    }
+
+    // crew wallet crawl — both PCs pool their top-20 holder snapshots
+    if (req.method === 'GET' && u.pathname === '/wallets') {
+      const since = parseInt(u.searchParams.get('since')) || 0;
+      const limit = Math.min(Math.max(parseInt(u.searchParams.get('limit')) || 200, 1), 400);
+      const book = await store.walletsGet(since, limit);
+      return send(res, 200, { count: Object.keys(book).length, book });
     }
 
     // crew bundle intel — GET open like /board, capped
@@ -299,6 +346,22 @@ const server = http.createServer(async (req, res) => {
         const n = await store.intelPut(entries);
         return send(res, 200, { ok: true, updated: n });
       }
+      if (u.pathname === '/wallets') {
+        if (!body.entries || typeof body.entries !== 'object') return send(res, 400, { error: 'need entries' });
+        const entries = {};
+        let i = 0;
+        for (const [mint, d] of Object.entries(body.entries)) {
+          if (++i > 100) break;
+          if (!d || !Array.isArray(d.top)) continue;
+          entries[String(mint).slice(0, 48)] = {
+            t: int(d.t) || Date.now(),
+            top: d.top.slice(0, 20).map(x => [String(x[0]).slice(0, 48), num(x[1])]),
+            by: body.user ? String(body.user).slice(0, 24) : null,
+          };
+        }
+        const n = await store.walletsPut(entries);
+        return send(res, 200, { ok: true, updated: n });
+      }
       if (u.pathname === '/peak') {
         if (!body.mint || !body.user) return send(res, 400, { error: 'need user+mint' });
         await store.updatePeak(String(body.user).slice(0, 24), String(body.mint).slice(0, 48), num(body.peakPct), num(body.livePct));
@@ -317,7 +380,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v1.4 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v1.5 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
