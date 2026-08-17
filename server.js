@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server
+// Trench Radar — shared calls server v1.3
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -38,11 +38,16 @@ function memStore() {
         if (livePct !== undefined) ex.livePct = livePct;
       }
     },
-    async board(sinceMs) {
-      return [...calls.values()].filter(c => c.t >= sinceMs);
+    async board(sinceMs, sort) {
+      const rows = [...calls.values()].filter(c => c.t >= sinceMs);
+      return sort === 'recent' ? rows.sort((a, b) => b.t - a.t) : rows.sort((a, b) => (b.peakPct ?? -1e9) - (a.peakPct ?? -1e9));
     },
     async ingest(user, kind, payload) { this._ingested = (this._ingested || 0) + 1; },
     async ingestCount() { return this._ingested || 0; },
+    async stats() {
+      const arr = [...calls.values()];
+      return { calls: arr.length, oldest: arr.length ? Math.min(...arr.map(c => c.t)) : null, newest: arr.length ? Math.max(...arr.map(c => c.t)) : null, archives: this._ingested || 0, byUser: [] };
+    },
   };
 }
 function pgStore() {
@@ -87,10 +92,11 @@ function pgStore() {
         [user, mint, peakPct ?? null, livePct ?? null]
       );
     },
-    async board(sinceMs) {
+    async board(sinceMs, sort) {
+      const order = sort === 'recent' ? 't DESC' : 'peak_pct DESC NULLS LAST';
       const r = await pool.query(
         `SELECT usr AS user, mint, name, mc, conv, t, peak_pct AS "peakPct", live_pct AS "livePct", rep
-         FROM calls WHERE t >= $1 ORDER BY peak_pct DESC NULLS LAST LIMIT 500`,
+         FROM calls WHERE t >= $1 ORDER BY ${order} LIMIT 800`,
         [sinceMs]
       );
       return r.rows;
@@ -103,13 +109,20 @@ function pgStore() {
       const r = await pool.query('SELECT COUNT(*) AS n FROM sessions');
       return parseInt(r.rows[0].n);
     },
+    async stats() {
+      const c = await pool.query('SELECT COUNT(*) AS calls, MIN(t) AS oldest, MAX(t) AS newest FROM calls');
+      const s = await pool.query('SELECT COUNT(*) AS archives FROM sessions');
+      const byUser = await pool.query('SELECT usr, COUNT(*) AS n FROM calls GROUP BY usr');
+      return { calls: parseInt(c.rows[0].calls), oldest: c.rows[0].oldest, newest: c.rows[0].newest, archives: parseInt(s.rows[0].archives), byUser: byUser.rows };
+    },
   };
 }
 
 // ------------------------------------------------------------------
 // Leaderboard shaping — dedupe by CA across users, keep best
 // ------------------------------------------------------------------
-function shapeBoard(rows, limit) {
+// dedupe by CA across users -> one row per coin (ALL of them, caller slices)
+function dedupeCoins(rows) {
   const byMint = new Map();
   for (const r of rows) {
     const g = byMint.get(r.mint);
@@ -127,10 +140,24 @@ function shapeBoard(rows, limit) {
       if (r.livePct != null) g.livePct = r.livePct;
     }
   }
-  return [...byMint.values()]
-    .sort((a, b) => (b.peakPct ?? -1e9) - (a.peakPct ?? -1e9))
-    .slice(0, limit || 25);
+  return [...byMint.values()].sort((a, b) => (b.peakPct ?? -1e9) - (a.peakPct ?? -1e9));
 }
+// newest-first feed: dedupe by coin, order by the crew's FIRST call time
+function dedupeRecent(rows) {
+  return dedupeCoins(rows).sort((a, b) => Number(b.t) - Number(a.t));
+}
+// W-L over EVERY coin in the window (not just the top 25) so both PCs match
+function computeWL(coins) {
+  const t = Date.now();
+  let w = 0, l = 0;
+  for (const c of coins) {
+    const peak = c.peakPct;
+    if (peak != null && peak >= 25) w++;
+    else if (t - Number(c.t) > 10 * 60 * 1000) l++;
+  }
+  return { w, l };
+}
+function shapeBoard(rows, limit) { return dedupeCoins(rows).slice(0, limit || 25); }
 
 // ------------------------------------------------------------------
 // HTTP
@@ -161,13 +188,23 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.3' });
+
+    if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
     if (req.method === 'GET' && u.pathname === '/board') {
       const win = WINDOWS[u.searchParams.get('window')] || WINDOWS['24h'];
+      const sort = u.searchParams.get('sort') === 'recent' ? 'recent' : 'peak';
+      const limit = Math.min(Math.max(parseInt(u.searchParams.get('limit')) || 25, 1), 100);
       const since = Date.now() - win;
-      const rows = await store.board(since);
-      return send(res, 200, { window: u.searchParams.get('window') || '24h', coins: shapeBoard(rows, 25) });
+      const rows = await store.board(since, sort);
+      // 'recent' = the crew's live call feed, newest first. 'peak' = leaderboard.
+      const all = sort === 'recent' ? dedupeRecent(rows) : dedupeCoins(rows);
+      const wl = computeWL(all);                // W-L over ALL of them (identical on every PC)
+      return send(res, 200, {
+        window: u.searchParams.get('window') || '24h', sort,
+        wins: wl.w, losses: wl.l, total: all.length, coins: all.slice(0, limit),
+      });
     }
 
     // writes require the shared key
@@ -212,8 +249,8 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v1.3 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
-module.exports = { shapeBoard, memStore }; // for offline tests
+module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore }; // for offline tests
