@@ -1,0 +1,15 @@
+{
+  "name": "trench-radar-server",
+  "version": "1.0.0",
+  "description": "Shared calls leaderboard for Trench Radar (dubski + Tony)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
