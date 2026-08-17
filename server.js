@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 3000;
 const RADAR_KEY = process.env.RADAR_KEY || 'trench-dev-key';
 const DATABASE_URL = process.env.DATABASE_URL || null;
 const MAX_BODY = 64 * 1024;
+const MAX_INGEST = 3 * 1024 * 1024; // full session payloads (samples/devBook/feed) can be ~0.5MB
 
 // ------------------------------------------------------------------
 // Storage layer — Postgres or in-memory, same interface
@@ -40,6 +41,8 @@ function memStore() {
     async board(sinceMs) {
       return [...calls.values()].filter(c => c.t >= sinceMs);
     },
+    async ingest(user, kind, payload) { this._ingested = (this._ingested || 0) + 1; },
+    async ingestCount() { return this._ingested || 0; },
   };
 }
 function pgStore() {
@@ -56,6 +59,13 @@ function pgStore() {
         UNIQUE(usr, mint)
       )`);
       await pool.query('CREATE INDEX IF NOT EXISTS calls_t_idx ON calls(t)');
+      // full session archives — EVERYTHING both bots see, forever
+      await pool.query(`CREATE TABLE IF NOT EXISTS sessions (
+        id SERIAL PRIMARY KEY,
+        usr TEXT NOT NULL, kind TEXT, t BIGINT NOT NULL,
+        payload JSONB NOT NULL
+      )`);
+      await pool.query('CREATE INDEX IF NOT EXISTS sessions_usr_t_idx ON sessions(usr, t)');
     },
     async upsertCall(c) {
       await pool.query(
@@ -84,6 +94,14 @@ function pgStore() {
         [sinceMs]
       );
       return r.rows;
+    },
+    async ingest(user, kind, payload) {
+      await pool.query('INSERT INTO sessions (usr, kind, t, payload) VALUES ($1,$2,$3,$4)',
+        [user, kind || 'auto', Date.now(), JSON.stringify(payload)]);
+    },
+    async ingestCount() {
+      const r = await pool.query('SELECT COUNT(*) AS n FROM sessions');
+      return parseInt(r.rows[0].n);
     },
   };
 }
@@ -127,10 +145,11 @@ function send(res, code, obj) {
   });
   res.end(body);
 }
-function readBody(req) {
+function readBody(req, cap) {
+  const limit = cap || MAX_BODY;
   return new Promise((resolve, reject) => {
     let data = '', size = 0;
-    req.on('data', ch => { size += ch.length; if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); } else data += ch; });
+    req.on('data', ch => { size += ch.length; if (size > limit) { reject(new Error('body too large')); req.destroy(); } else data += ch; });
     req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
     req.on('error', reject);
   });
@@ -154,6 +173,15 @@ const server = http.createServer(async (req, res) => {
     // writes require the shared key
     if (req.method === 'POST') {
       if ((req.headers['x-radar-key'] || '') !== RADAR_KEY) return send(res, 401, { error: 'bad key' });
+
+      // full session archive — the bot auto-uploads EVERYTHING here every 30min
+      if (u.pathname === '/ingest') {
+        const big = await readBody(req, MAX_INGEST);
+        if (!big.user) return send(res, 400, { error: 'need user' });
+        await store.ingest(String(big.user).slice(0, 24), big.kind, big);
+        const n = await store.ingestCount();
+        return send(res, 200, { ok: true, archived: n });
+      }
       const body = await readBody(req);
 
       if (u.pathname === '/call') {
