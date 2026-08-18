@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v1.5
+// Trench Radar — shared calls server v1.6
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -228,13 +228,14 @@ function dedupeRecent(rows) {
   return dedupeCoins(rows).sort((a, b) => Number(b.t) - Number(a.t));
 }
 // W-L over EVERY coin in the window (not just the top 25) so both PCs match
+// v1.6 (dubski's scoreboard): W = 2x'd (peak >= 100). L = never 2x'd AND
+// currently bled (live <= -50). Flat/pending = neither.
 function computeWL(coins) {
-  const t = Date.now();
   let w = 0, l = 0;
   for (const c of coins) {
     const peak = c.peakPct;
-    if (peak != null && peak >= 25) w++;
-    else if (t - Number(c.t) > 10 * 60 * 1000) l++;
+    if (peak != null && peak >= 100) w++;
+    else if (c.livePct != null && c.livePct <= -50) l++;
   }
   return { w, l };
 }
@@ -269,7 +270,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.5' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.6' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -380,7 +381,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v1.5 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v1.6 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
