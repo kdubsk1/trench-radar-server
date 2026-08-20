@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v1.6
+// Trench Radar — shared calls server v1.7
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -12,6 +12,29 @@ const RADAR_KEY = process.env.RADAR_KEY || 'trench-dev-key';
 const DATABASE_URL = process.env.DATABASE_URL || null;
 const MAX_BODY = 64 * 1024;
 const MAX_INGEST = 3 * 1024 * 1024; // full session payloads (samples/devBook/feed) can be ~0.5MB
+
+// v1.7 MERGE RULES — non-destructive, identical to the client's ledgerWrite.
+// A win is permanent, a peak only ever rises, a worst only ever falls, and the
+// earliest call time wins. Two PCs writing the same coin therefore converge on
+// the same row no matter who writes last — order can never change the result.
+function mergeBook(kind, a, b) {
+  if (kind !== 'ledger') return null;            // archives: first write wins
+  const out = { ...a };
+  let changed = false;
+  const num = x => (typeof x === 'number' && isFinite(x) ? x : null);
+  const pa = num(a.peak), pb = num(b.peak);
+  if (pb !== null && (pa === null || pb > pa)) { out.peak = pb; changed = true; }
+  const wa = num(a.worst), wb = num(b.worst);
+  if (wb !== null && (wa === null || wb < wa)) { out.worst = wb; changed = true; }
+  if (b.t && (!a.t || b.t < a.t)) { out.t = b.t; changed = true; }
+  if (!a.name && b.name) { out.name = b.name; changed = true; }
+  if (!a.s && b.s) { out.s = b.s; changed = true; }
+  const peak = num(out.peak), worst = num(out.worst);
+  const v = (a.v === 'W' || b.v === 'W' || (peak !== null && peak >= 100)) ? 'W'
+    : ((worst !== null && worst <= -50) ? 'L' : 'F');
+  if (v !== a.v) { out.v = v; changed = true; }
+  return changed ? out : null;
+}
 
 // ------------------------------------------------------------------
 // Storage layer — Postgres or in-memory, same interface
@@ -43,6 +66,24 @@ function memStore() {
       return sort === 'recent' ? rows.sort((a, b) => b.t - a.t) : rows.sort((a, b) => (b.peakPct ?? -1e9) - (a.peakPct ?? -1e9));
     },
     async ingest(user, kind, payload) { this._ingested = (this._ingested || 0) + 1; },
+    async booksPut(user, kind, rows) {
+      this._books = this._books || {};
+      const book = this._books[kind] = this._books[kind] || {};
+      let added = 0, merged = 0;
+      for (const [mint, d] of Object.entries(rows || {})) {
+        if (!mint || typeof d !== 'object' || d === null) continue;
+        if (!book[mint]) { book[mint] = Object.assign({}, d, { u: d.u || user }); added++; continue; }
+        const out = mergeBook(kind, book[mint], d);
+        if (out) { book[mint] = out; merged++; }
+      }
+      return { added, merged };
+    },
+    async booksGet(kind, since, limit) {
+      const book = (this._books || {})[kind] || {};
+      const out = {};
+      for (const [m, d] of Object.entries(book)) if ((d.t || 0) >= (Number(since) || 0)) out[m] = d;
+      return out;
+    },
     async walletsPut(entries) {
       this._wal = this._wal || new Map();
       let n = 0;
@@ -113,6 +154,45 @@ function pgStore() {
         mint TEXT PRIMARY KEY, t BIGINT NOT NULL, data JSONB NOT NULL
       )`);
       await pool.query('CREATE INDEX IF NOT EXISTS wallets_t_idx ON wallets(t)');
+      // v1.7 CREW BOOKS — the permanent record, shared. kind = ledger | runner
+      // | closed, one row per (kind, mint). `usr` is whoever called it first,
+      // so the client can still separate MINE from CREW.
+      await pool.query(`CREATE TABLE IF NOT EXISTS books (
+        kind TEXT NOT NULL, mint TEXT NOT NULL, usr TEXT NOT NULL,
+        t BIGINT NOT NULL, upd BIGINT NOT NULL, data JSONB NOT NULL,
+        PRIMARY KEY (kind, mint)
+      )`);
+      await pool.query('CREATE INDEX IF NOT EXISTS books_kind_upd_idx ON books(kind, upd)');
+    },
+    async booksPut(user, kind, rows) {
+      let added = 0, merged = 0;
+      for (const [mint, d] of Object.entries(rows || {})) {
+        if (!mint || typeof d !== 'object' || d === null) continue;
+        const key = String(mint).slice(0, 48);
+        const cur = await pool.query('SELECT data FROM books WHERE kind=$1 AND mint=$2', [kind, key]);
+        if (!cur.rows.length) {
+          await pool.query(
+            'INSERT INTO books (kind,mint,usr,t,upd,data) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (kind,mint) DO NOTHING',
+            [kind, key, String(d.u || user).slice(0, 24), Number(d.t) || Date.now(), Date.now(), JSON.stringify(d)]);
+          added++;
+          continue;
+        }
+        const out = mergeBook(kind, cur.rows[0].data || {}, d);
+        if (out) {
+          await pool.query('UPDATE books SET data=$1, upd=$2 WHERE kind=$3 AND mint=$4',
+            [JSON.stringify(out), Date.now(), kind, key]);
+          merged++;
+        }
+      }
+      return { added, merged };
+    },
+    async booksGet(kind, since, limit) {
+      const r = await pool.query(
+        'SELECT mint, usr, t, data FROM books WHERE kind=$1 AND upd >= $2 ORDER BY upd DESC LIMIT $3',
+        [kind, Number(since) || 0, Math.min(Number(limit) || 4000, 8000)]);
+      const out = {};
+      for (const row of r.rows) out[row.mint] = Object.assign({}, row.data, { u: (row.data && row.data.u) || row.usr });
+      return out;
     },
     async upsertCall(c) {
       await pool.query(
@@ -270,7 +350,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.6' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.7' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -298,6 +378,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     // crew bundle intel — GET open like /board, capped
+    // v1.7 — GET /books?kind=ledger|runner|closed&since=<ms>
+    if (req.method === 'GET' && u.pathname === '/books') {
+      const kind = String(u.searchParams.get('kind') || 'ledger');
+      if (!['ledger', 'runner', 'closed'].includes(kind)) return send(res, 400, { error: 'bad kind' });
+      const rows = await store.booksGet(kind, Number(u.searchParams.get('since')) || 0,
+        Number(u.searchParams.get('limit')) || 4000);
+      return send(res, 200, { kind, count: Object.keys(rows).length, rows });
+    }
     if (req.method === 'GET' && u.pathname === '/intel') {
       const since = parseInt(u.searchParams.get('since')) || 0;
       const limit = Math.min(Math.max(parseInt(u.searchParams.get('limit')) || 400, 1), 800);
@@ -347,6 +435,18 @@ const server = http.createServer(async (req, res) => {
         const n = await store.intelPut(entries);
         return send(res, 200, { ok: true, updated: n });
       }
+      // v1.7 — POST /books {user, kind, rows:{mint:{...}}}
+      // Each PC pushes what it knows; the server merges without ever losing a
+      // verdict. This is what finally makes dubski's and Tony's records equal.
+      if (u.pathname === '/books') {
+        const big = await readBody(req, MAX_INGEST);
+        if (!big.user || !big.kind) return send(res, 400, { error: 'need user+kind' });
+        if (!['ledger', 'runner', 'closed'].includes(big.kind)) return send(res, 400, { error: 'bad kind' });
+        const rows = big.rows && typeof big.rows === 'object' ? big.rows : {};
+        if (Object.keys(rows).length > 6000) return send(res, 413, { error: 'too many rows' });
+        const r = await store.booksPut(String(big.user).slice(0, 24), big.kind, rows);
+        return send(res, 200, { ok: true, ...r });
+      }
       if (u.pathname === '/wallets') {
         if (!body.entries || typeof body.entries !== 'object') return send(res, 400, { error: 'need entries' });
         const entries = {};
@@ -381,7 +481,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v1.6 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v1.7 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
