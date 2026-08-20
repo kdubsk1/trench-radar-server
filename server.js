@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v1.7
+// Trench Radar — shared calls server v1.8
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -17,8 +17,44 @@ const MAX_INGEST = 3 * 1024 * 1024; // full session payloads (samples/devBook/fe
 // A win is permanent, a peak only ever rises, a worst only ever falls, and the
 // earliest call time wins. Two PCs writing the same coin therefore converge on
 // the same row no matter who writes last — order can never change the result.
+// v1.8 — every shared book, and how two PCs reconcile it.
+//   ledger    verdicts        merge rules below (a W is permanent)
+//   runner/closed archives    immutable, first write wins
+//   devbook   dev reputation  counters take the MAX (both PCs counted real events)
+//   rug/devban/hidden/hotwallet/wmeta  newest reading wins
+const BOOK_KINDS = ['ledger', 'runner', 'closed', 'rug', 'devban', 'hidden', 'devbook', 'hotwallet', 'wmeta'];
 function mergeBook(kind, a, b) {
-  if (kind !== 'ledger') return null;            // archives: first write wins
+  if (kind === 'runner' || kind === 'closed') {
+    // Archives record a MOMENT (hit 2x / died). "First write wins" made the
+    // result depend on who happened to push first, so two PCs kept different
+    // copies forever. The earliest observation is the true one, with a
+    // deterministic tie-break, so both sides converge no matter the order.
+    const at = Number(a && a.t) || 0, bt = Number(b && b.t) || 0;
+    if (bt && (!at || bt < at)) return { ...b };
+    if (bt === at) {
+      const as = JSON.stringify(a), bs = JSON.stringify(b);
+      if (bs < as) return { ...b };
+    }
+    return null;
+  }
+  if (kind === 'devbook') {
+    // both PCs watched the same dev independently — neither count is wrong,
+    // so take the higher of each and the most recent sighting.
+    const out = { ...a };
+    let changed = false;
+    for (const f of ['seen', 'rugged', 'ran', 'dumped']) {
+      const av = Number(a[f]) || 0, bv = Number(b[f]) || 0;
+      if (bv > av) { out[f] = bv; changed = true; }
+    }
+    if ((Number(b.last) || 0) > (Number(a.last) || 0)) { out.last = b.last; changed = true; }
+    return changed ? out : null;
+  }
+  if (kind !== 'ledger') {
+    // newest reading wins, and a flag once set is never silently unset
+    const at = Number(a.t) || 0, bt = Number(b.t) || 0;
+    if (bt > at) return { ...a, ...b };
+    return null;
+  }
   const out = { ...a };
   let changed = false;
   const num = x => (typeof x === 'number' && isFinite(x) ? x : null);
@@ -350,7 +386,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.7' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.8' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -381,7 +417,7 @@ const server = http.createServer(async (req, res) => {
     // v1.7 — GET /books?kind=ledger|runner|closed&since=<ms>
     if (req.method === 'GET' && u.pathname === '/books') {
       const kind = String(u.searchParams.get('kind') || 'ledger');
-      if (!['ledger', 'runner', 'closed'].includes(kind)) return send(res, 400, { error: 'bad kind' });
+      if (!BOOK_KINDS.includes(kind)) return send(res, 400, { error: 'bad kind' });
       const rows = await store.booksGet(kind, Number(u.searchParams.get('since')) || 0,
         Number(u.searchParams.get('limit')) || 4000);
       return send(res, 200, { kind, count: Object.keys(rows).length, rows });
@@ -441,7 +477,7 @@ const server = http.createServer(async (req, res) => {
       if (u.pathname === '/books') {
         const big = await readBody(req, MAX_INGEST);
         if (!big.user || !big.kind) return send(res, 400, { error: 'need user+kind' });
-        if (!['ledger', 'runner', 'closed'].includes(big.kind)) return send(res, 400, { error: 'bad kind' });
+        if (!BOOK_KINDS.includes(big.kind)) return send(res, 400, { error: 'bad kind' });
         const rows = big.rows && typeof big.rows === 'object' ? big.rows : {};
         if (Object.keys(rows).length > 6000) return send(res, 413, { error: 'too many rows' });
         const r = await store.booksPut(String(big.user).slice(0, 24), big.kind, rows);
@@ -481,7 +517,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v1.7 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v1.8 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
