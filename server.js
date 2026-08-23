@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v1.8
+// Trench Radar — shared calls server v2.0
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -481,7 +481,16 @@ function send(res, code, obj) {
   });
   res.end(body);
 }
+// IDEMPOTENT. A Node request stream can be read exactly once — a second
+// readBody() on the same request attaches listeners to a stream that already
+// ended, so 'end' never fires and the promise never settles. That silently
+// hung every POST /books from v1.7 until v2.0. Caching the promise makes the
+// whole class of bug impossible rather than fixing one instance of it.
 function readBody(req, cap) {
+  if (req._trBody) return req._trBody;
+  return (req._trBody = readBodyOnce(req, cap));
+}
+function readBodyOnce(req, cap) {
   const limit = cap || MAX_BODY;
   return new Promise((resolve, reject) => {
     let data = '', size = 0;
@@ -497,7 +506,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.9' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.0' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -549,15 +558,35 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST') {
       if ((req.headers['x-radar-key'] || '') !== RADAR_KEY) return send(res, 401, { error: 'bad key' });
 
+      // ⚠ ONE READ, AT THE TOP, FOR EVERY POST. Read the note on readBody().
+      //
+      // THE BUG THIS FIXES — /books has never worked, not once, since v1.7.
+      // The handler order was:
+      //     if (u.pathname === '/ingest') { await readBody(req, MAX_INGEST); ... }
+      //     const body = await readBody(req);            // <- consumed the stream
+      //     ...
+      //     if (u.pathname === '/books') {
+      //       const big = await readBody(req, MAX_INGEST);  // <- SECOND read
+      // A Node request stream can only be read once. The second readBody added
+      // 'data'/'end' listeners to a stream that had already ended, so those
+      // events never fired again and the promise never settled: the handler
+      // hung, the server never replied, the client timed out. Reproduced
+      // against this exact file — POST /call returns 200, POST /books returns
+      // nothing in 3.5s. That is why /books?kind=ledger|rug|devbook all report
+      // count 0 on the live server while /board holds 758 calls.
+      //
+      // I previously blamed the client's booksServerOk latch and the unknown
+      // `good` kind for this outage. Both were real bugs and both are fixed,
+      // but NEITHER was the reason nothing synced. It was always this line.
+      const body = await readBody(req, MAX_INGEST);
+
       // full session archive — the bot auto-uploads EVERYTHING here every 30min
       if (u.pathname === '/ingest') {
-        const big = await readBody(req, MAX_INGEST);
-        if (!big.user) return send(res, 400, { error: 'need user' });
-        await store.ingest(String(big.user).slice(0, 24), big.kind, big);
+        if (!body.user) return send(res, 400, { error: 'need user' });
+        await store.ingest(String(body.user).slice(0, 24), body.kind, body);
         const n = await store.ingestCount();
         return send(res, 200, { ok: true, archived: n });
       }
-      const body = await readBody(req);
 
       if (u.pathname === '/call') {
         if (!body.mint || !body.user) return send(res, 400, { error: 'need user+mint' });
@@ -591,12 +620,11 @@ const server = http.createServer(async (req, res) => {
       // Each PC pushes what it knows; the server merges without ever losing a
       // verdict. This is what finally makes dubski's and Tony's records equal.
       if (u.pathname === '/books') {
-        const big = await readBody(req, MAX_INGEST);
-        if (!big.user || !big.kind) return send(res, 400, { error: 'need user+kind' });
-        if (!BOOK_KINDS.includes(big.kind)) return send(res, 400, { error: 'bad kind' });
-        const rows = big.rows && typeof big.rows === 'object' ? big.rows : {};
+        if (!body.user || !body.kind) return send(res, 400, { error: 'need user+kind' });
+        if (!BOOK_KINDS.includes(body.kind)) return send(res, 400, { error: 'bad kind' });
+        const rows = body.rows && typeof body.rows === 'object' ? body.rows : {};
         if (Object.keys(rows).length > 6000) return send(res, 413, { error: 'too many rows' });
-        const r = await store.booksPut(String(big.user).slice(0, 24), big.kind, rows);
+        const r = await store.booksPut(String(body.user).slice(0, 24), body.kind, rows);
         return send(res, 200, { ok: true, ...r });
       }
       if (u.pathname === '/wallets') {
@@ -633,7 +661,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v1.8 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.0 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
