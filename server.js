@@ -22,8 +22,66 @@ const MAX_INGEST = 3 * 1024 * 1024; // full session payloads (samples/devBook/fe
 //   runner/closed archives    immutable, first write wins
 //   devbook   dev reputation  counters take the MAX (both PCs counted real events)
 //   rug/devban/hidden/hotwallet/wmeta  newest reading wins
-const BOOK_KINDS = ['ledger', 'runner', 'closed', 'rug', 'devban', 'hidden', 'devbook', 'hotwallet', 'wmeta'];
+//   early     early-window book   union of windows, widest outcome envelope
+//   paper     paper trades        union of policies, first close per policy wins
+//
+// ⚠ ADDING A KIND HERE IS HALF THE JOB. The other half is uploading this file
+// to GitHub so Railway redeploys. v0.87 shipped the `good` kind to a server
+// that did not have it, every POST came back 400, and the client's
+// `booksServerOk` latch turned that single 400 into a total sync blackout for
+// EVERY book. Client fixed in v0.88 (per-kind skip), and tests/ship-gate.js
+// now fails the build if the script's SYNC_BOOKS and this list disagree.
+const BOOK_KINDS = ['ledger', 'runner', 'closed', 'rug', 'good', 'devban', 'hidden',
+                    'devbook', 'hotwallet', 'wmeta', 'early', 'paper'];
 function mergeBook(kind, a, b) {
+  if (kind === 'early') {
+    // Two PCs watch the same coin from different moments. Neither reading is
+    // wrong: keep the EARLIEST sighting, fill any window the other side
+    // served and we missed, and widen the outcome envelope to cover both.
+    // A null window is a recorded MISS and must never overwrite a real one.
+    const out = { ...a };
+    let changed = false;
+    if (b.t0 && (!a.t0 || b.t0 < a.t0)) {
+      out.t0 = b.t0;
+      for (const f of ['age0', 'mc0', 'vol0', 'hold0', 'top0']) if (b[f] !== undefined) out[f] = b[f];
+      changed = true;
+    }
+    const aw = (a.w && typeof a.w === 'object') ? a.w : {};
+    const bw = (b.w && typeof b.w === 'object') ? b.w : {};
+    const w = { ...aw };
+    for (const k of Object.keys(bw)) {
+      if (w[k] === undefined || (w[k] === null && bw[k] !== null)) { w[k] = bw[k]; changed = true; }
+    }
+    if (changed) out.w = w;
+    if (b.peakMc !== undefined && (out.peakMc === undefined || b.peakMc > out.peakMc)) { out.peakMc = b.peakMc; changed = true; }
+    if (b.lowMc !== undefined && (out.lowMc === undefined || b.lowMc < out.lowMc)) { out.lowMc = b.lowMc; changed = true; }
+    if ((Number(b.lastT) || 0) > (Number(a.lastT) || 0)) { out.lastT = b.lastT; out.lastMc = b.lastMc; changed = true; }
+    if ((Number(b.seenN) || 0) > (Number(a.seenN) || 0)) { out.seenN = b.seenN; changed = true; }
+    if (!a.name && b.name) { out.name = b.name; changed = true; }
+    if (a.called === undefined && b.called !== undefined) { out.called = b.called; changed = true; }
+    if (a.veto === undefined && b.veto !== undefined) { out.veto = b.veto; changed = true; }
+    return changed ? out : null;
+  }
+  if (kind === 'paper') {
+    // One row per coin holding EVERY policy's simulated trade, so the 48-char
+    // mint stays the key. A closed trade is a historical fact — first close
+    // per policy wins, and an open position never overwrites a closed one.
+    const out = { ...a };
+    const ap = (a.p && typeof a.p === 'object') ? a.p : {};
+    const bp = (b.p && typeof b.p === 'object') ? b.p : {};
+    const p = { ...ap };
+    let changed = false;
+    for (const k of Object.keys(bp)) {
+      const cur = p[k], inc = bp[k];
+      if (!inc || typeof inc !== 'object') continue;
+      if (!cur) { p[k] = inc; changed = true; continue; }
+      if (cur.out === undefined && inc.out !== undefined) { p[k] = inc; changed = true; }
+    }
+    if (changed) out.p = p;
+    if (b.t && (!a.t || b.t < a.t)) { out.t = b.t; changed = true; }
+    if (!a.name && b.name) { out.name = b.name; changed = true; }
+    return changed ? out : null;
+  }
   if (kind === 'runner' || kind === 'closed') {
     // Archives record a MOMENT (hit 2x / died). "First write wins" made the
     // result depend on who happened to push first, so two PCs kept different
@@ -101,6 +159,7 @@ function memStore() {
       const rows = [...calls.values()].filter(c => c.t >= sinceMs);
       return sort === 'recent' ? rows.sort((a, b) => b.t - a.t) : rows.sort((a, b) => (b.peakPct ?? -1e9) - (a.peakPct ?? -1e9));
     },
+    async wlWindow(sinceMs) { return wlFromRows([...calls.values()].filter(c => c.t >= sinceMs)); },
     async ingest(user, kind, payload) { this._ingested = (this._ingested || 0) + 1; },
     async booksPut(user, kind, rows) {
       this._books = this._books || {};
@@ -259,6 +318,21 @@ function pgStore() {
       );
       return r.rows;
     },
+    // W-L over EVERY call in the window, aggregated in SQL. Deliberately NOT
+    // built from board() — see the note on wlFromRows.
+    async wlWindow(sinceMs) {
+      const r = await pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE peak >= 100) AS w,
+           COUNT(*) FILTER (WHERE peak < 100 AND live <= -50) AS l,
+           COUNT(*) AS total
+         FROM (SELECT mint, MAX(COALESCE(peak_pct,0)) AS peak, MIN(live_pct) AS live
+               FROM calls WHERE t >= $1 GROUP BY mint) q`,
+        [sinceMs]
+      );
+      const row = r.rows[0] || {};
+      return { w: Number(row.w) || 0, l: Number(row.l) || 0, total: Number(row.total) || 0 };
+    },
     async ingest(user, kind, payload) {
       await pool.query('INSERT INTO sessions (usr, kind, t, payload) VALUES ($1,$2,$3,$4)',
         [user, kind || 'auto', Date.now(), JSON.stringify(payload)]);
@@ -346,6 +420,24 @@ function dedupeRecent(rows) {
 // W-L over EVERY coin in the window (not just the top 25) so both PCs match
 // v1.6 (dubski's scoreboard): W = 2x'd (peak >= 100). L = never 2x'd AND
 // currently bled (live <= -50). Flat/pending = neither.
+// v1.9 — SELECTION ON THE OUTCOME. The bug, named.
+//
+// This used to be called as computeWL(dedupeCoins(rows)) inside the /board
+// handler, and `rows` came from `board(since, sort)` which runs
+//     ORDER BY peak_pct DESC NULLS LAST LIMIT 800
+// when sort=peak. So the "win rate" was computed over the 800 HIGHEST-PEAK
+// calls. Measured on the live server 2026-08-23:
+//     /board?window=all&sort=peak   -> wins 758, losses 0,   total 758
+//     /board?window=all&sort=recent -> wins 194, losses 379, total 730
+// Same database, same window, the record changes with the sort order, and the
+// leaderboard was showing a 758-0 record. That is scoring a sample chosen BY
+// the score — the collider bias that has already cost this project four
+// hypotheses (top10, p10s, runner radar, the age cohort). It should never have
+// been in the code that reports our own performance.
+//
+// computeWL survives only for the test suites and for callers that already
+// hold an unbiased set. The /board handler now uses store.wlWindow(), which
+// aggregates EVERY call in the window regardless of sort.
 function computeWL(coins) {
   let w = 0, l = 0;
   for (const c of coins) {
@@ -354,6 +446,25 @@ function computeWL(coins) {
     else if (c.livePct != null && c.livePct <= -50) l++;
   }
   return { w, l };
+}
+// deduped by mint, then scored — identical rules to computeWL, but the caller
+// must hand it EVERY row in the window, not a slice ordered by outcome
+function wlFromRows(rows) {
+  const byMint = new Map();
+  for (const r of rows) {
+    const g = byMint.get(r.mint);
+    const peak = r.peakPct ?? 0;
+    const live = r.livePct;
+    if (!g) { byMint.set(r.mint, { peak, live }); continue; }
+    if (peak > g.peak) g.peak = peak;
+    if (live != null && (g.live == null || live < g.live)) g.live = live;
+  }
+  let w = 0, l = 0;
+  for (const g of byMint.values()) {
+    if (g.peak >= 100) w++;
+    else if (g.live != null && g.live <= -50) l++;
+  }
+  return { w, l, total: byMint.size };
 }
 function shapeBoard(rows, limit) { return dedupeCoins(rows).slice(0, limit || 25); }
 
@@ -386,7 +497,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.8' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '1.9' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -398,10 +509,15 @@ const server = http.createServer(async (req, res) => {
       const rows = await store.board(since, sort);
       // 'recent' = the crew's live call feed, newest first. 'peak' = leaderboard.
       const all = sort === 'recent' ? dedupeRecent(rows) : dedupeCoins(rows);
-      const wl = computeWL(all);                // W-L over ALL of them (identical on every PC)
+      // v1.9: the record is computed over the WHOLE window, never over the
+      // slice we happen to be displaying. When sort=peak that slice is chosen
+      // by peak, which reported 758 wins and 0 losses. See computeWL's note.
+      const wl = await store.wlWindow(since);
       return send(res, 200, {
         window: u.searchParams.get('window') || '24h', sort,
-        wins: wl.w, losses: wl.l, total: all.length, coins: all.slice(0, limit),
+        wins: wl.w, losses: wl.l, total: wl.total,
+        shown: all.length, coins: all.slice(0, limit),
+        wlBasis: 'every call in the window, deduped by mint — independent of sort',
       });
     }
 
