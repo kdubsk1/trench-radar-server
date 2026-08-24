@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.0
+// Trench Radar — shared calls server v2.1
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -233,6 +233,14 @@ function pgStore() {
         UNIQUE(usr, mint)
       )`);
       await pool.query('CREATE INDEX IF NOT EXISTS calls_t_idx ON calls(t)');
+      // v2.1 — call-time features. Until these existed, vol/holders/pro/top10/
+      // snipers never left the browser and no rule could be scored off the
+      // server (Claude Code round 11 §1.3). Nullable, so old clients are fine.
+      for (const col of ['vol DOUBLE PRECISION', 'holders INTEGER', 'pro INTEGER',
+                         'top10 DOUBLE PRECISION', 'snipers INTEGER',
+                         'age INTEGER', 'watch INTEGER']) {
+        await pool.query('ALTER TABLE calls ADD COLUMN IF NOT EXISTS ' + col);
+      }
       // full session archives — EVERYTHING both bots see, forever
       await pool.query(`CREATE TABLE IF NOT EXISTS sessions (
         id SERIAL PRIMARY KEY,
@@ -291,13 +299,21 @@ function pgStore() {
     },
     async upsertCall(c) {
       await pool.query(
-        `INSERT INTO calls (usr,mint,name,mc,conv,t,peak_pct,live_pct,rep)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1)
+        `INSERT INTO calls (usr,mint,name,mc,conv,t,peak_pct,live_pct,rep,vol,holders,pro,top10,snipers,age,watch)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$10,$11,$12,$13,$14,$15)
          ON CONFLICT (usr,mint) DO UPDATE SET
            rep = calls.rep + 1,
            t = LEAST(calls.t, EXCLUDED.t),
+           vol = COALESCE(calls.vol, EXCLUDED.vol),
+           holders = COALESCE(calls.holders, EXCLUDED.holders),
+           pro = COALESCE(calls.pro, EXCLUDED.pro),
+           top10 = COALESCE(calls.top10, EXCLUDED.top10),
+           snipers = COALESCE(calls.snipers, EXCLUDED.snipers),
+           age = COALESCE(calls.age, EXCLUDED.age),
+           watch = COALESCE(calls.watch, EXCLUDED.watch),
            mc = CASE WHEN EXCLUDED.t < calls.t THEN EXCLUDED.mc ELSE calls.mc END`,
-        [c.user, c.mint, c.name || null, c.mc ?? null, c.conv ?? null, c.t, c.peakPct ?? 0, c.livePct ?? null]
+        [c.user, c.mint, c.name || null, c.mc ?? null, c.conv ?? null, c.t, c.peakPct ?? 0, c.livePct ?? null,
+         c.vol ?? null, c.holders ?? null, c.pro ?? null, c.top10 ?? null, c.snipers ?? null, c.age ?? null, c.watch ?? null]
       );
     },
     async updatePeak(user, mint, peakPct, livePct) {
@@ -506,7 +522,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.0' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.1' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -595,6 +611,11 @@ const server = http.createServer(async (req, res) => {
           name: body.name ? String(body.name).slice(0, 32) : null,
           mc: num(body.mc), conv: int(body.conv), t: int(body.t) || Date.now(),
           peakPct: num(body.peakPct), livePct: num(body.livePct),
+          // v2.1 — call-time features (round 11 §1.3: these never left the
+          // browser before, so no rule could be scored off the server)
+          vol: num(body.vol), holders: int(body.holders), pro: int(body.pro),
+          top10: num(body.top10), snipers: int(body.snipers),
+          age: int(body.age), watch: int(body.watch),
         });
         return send(res, 200, { ok: true });
       }
@@ -661,7 +682,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v2.0 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.1 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
