@@ -160,6 +160,20 @@ function memStore() {
       return sort === 'recent' ? rows.sort((a, b) => b.t - a.t) : rows.sort((a, b) => (b.peakPct ?? -1e9) - (a.peakPct ?? -1e9));
     },
     async wlWindow(sinceMs) { return wlFromRows([...calls.values()].filter(c => c.t >= sinceMs)); },
+    // v2.2 #135 — REPLACES the stored peak (updatePeak can only raise it, so
+    // a fake like Ferdinand +8725% was permanent). Repairs every user's row
+    // for the mint: the fake was served to every viewer.
+    async fixPeak(mint, peakPct) {
+      let n = 0;
+      for (const ex of calls.values()) if (ex.mint === mint) { ex.peakPct = peakPct; n++; }
+      return n;
+    },
+    async dump(what, opt) {
+      if (what === 'calls') return { what, rows: [...calls.values()] };
+      if (what === 'books') return { what, kind: opt.kind, rows: ((this._books || {})[opt.kind]) || {} };
+      if (what === 'sessions') return { what, note: 'mem store keeps no session payloads', rows: [] };
+      return null;
+    },
     async ingest(user, kind, payload) { this._ingested = (this._ingested || 0) + 1; },
     async booksPut(user, kind, rows) {
       this._books = this._books || {};
@@ -324,6 +338,41 @@ function pgStore() {
          WHERE usr=$1 AND mint=$2`,
         [user, mint, peakPct ?? null, livePct ?? null]
       );
+    },
+    // v2.2 #135 — REPLACES the stored peak for every user's row of the mint.
+    // updatePeak's GREATEST can only raise, so a corrupted running-max could
+    // never be repaired from the client side.
+    async fixPeak(mint, peakPct) {
+      const r = await pool.query('UPDATE calls SET peak_pct = $2 WHERE mint = $1', [mint, peakPct]);
+      return r.rowCount;
+    },
+    // v2.2 — the READ side of the archive. /ingest has been writing both PCs'
+    // sessions to Postgres for months; this is how analysis gets them back
+    // out without anyone hand-exporting.
+    async dump(what, opt) {
+      if (what === 'calls') {
+        const r = await pool.query(
+          `SELECT usr AS user, mint, name, mc, conv, t, peak_pct AS "peakPct", live_pct AS "livePct", rep,
+                  vol, holders, pro, top10, snipers, age, watch
+           FROM calls ORDER BY t DESC LIMIT 20000`);
+        return { what, rows: r.rows };
+      }
+      if (what === 'books') {
+        const r = await pool.query('SELECT mint, usr, t, upd, data FROM books WHERE kind = $1 ORDER BY upd DESC LIMIT 20000', [opt.kind]);
+        const rows = {};
+        for (const x of r.rows) rows[x.mint] = Object.assign({}, x.data, { u: x.usr });
+        return { what, kind: opt.kind, rows };
+      }
+      if (what === 'sessions') {
+        const r = await pool.query(
+          `SELECT id, usr, kind, t, pg_column_size(payload) AS bytes FROM sessions ORDER BY t DESC LIMIT 500`);
+        return { what, rows: r.rows };
+      }
+      if (what === 'session') {
+        const r = await pool.query('SELECT id, usr, kind, t, payload FROM sessions WHERE id = $1', [opt.id]);
+        return { what, row: r.rows[0] || null };
+      }
+      return null;
     },
     async board(sinceMs, sort) {
       const order = sort === 'recent' ? 't DESC' : 'peak_pct DESC NULLS LAST';
@@ -522,7 +571,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.1' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.2' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -563,6 +612,24 @@ const server = http.createServer(async (req, res) => {
         Number(u.searchParams.get('limit')) || 4000);
       return send(res, 200, { kind, count: Object.keys(rows).length, rows });
     }
+    // v2.2 — full-archive reads. Key-gated even though it is a GET: calls
+    // carry wallet tags and the sessions hold whole exports.
+    if (req.method === 'GET' && u.pathname === '/dump') {
+      if ((req.headers['x-radar-key'] || u.searchParams.get('key') || '') !== RADAR_KEY) {
+        return send(res, 401, { error: 'bad key' });
+      }
+      const what = String(u.searchParams.get('what') || 'calls');
+      if (!['calls', 'books', 'sessions', 'session'].includes(what)) return send(res, 400, { error: 'what?' });
+      if (what === 'books' && !BOOK_KINDS.includes(String(u.searchParams.get('kind') || ''))) {
+        return send(res, 400, { error: 'bad kind' });
+      }
+      const out = await store.dump(what, {
+        kind: String(u.searchParams.get('kind') || ''),
+        id: parseInt(u.searchParams.get('id')) || 0,
+      });
+      if (!out) return send(res, 400, { error: 'dump unsupported' });
+      return send(res, 200, out);
+    }
     if (req.method === 'GET' && u.pathname === '/intel') {
       const since = parseInt(u.searchParams.get('since')) || 0;
       const limit = Math.min(Math.max(parseInt(u.searchParams.get('limit')) || 400, 1), 800);
@@ -597,6 +664,15 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req, MAX_INGEST);
 
       // full session archive — the bot auto-uploads EVERYTHING here every 30min
+      // v2.2 #135 — a locally repaired peak REPLACES the server's number
+      if (u.pathname === '/fixpeak') {
+        if (!body.mint || typeof body.peakPct !== 'number' || !isFinite(body.peakPct)) {
+          return send(res, 400, { error: 'need mint + numeric peakPct' });
+        }
+        const n = await store.fixPeak(String(body.mint), body.peakPct);
+        return send(res, 200, { ok: true, repaired: n, was: body.was ?? null });
+      }
+
       if (u.pathname === '/ingest') {
         if (!body.user) return send(res, 400, { error: 'need user' });
         await store.ingest(String(body.user).slice(0, 24), body.kind, body);
