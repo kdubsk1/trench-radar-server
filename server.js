@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.8
+// Trench Radar — shared calls server v2.9
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -609,7 +609,8 @@ function scaleRet(peakPct, livePct) {
   ret += rem * (exit - 1 - cost);
   return { ret, closed, sold };
 }
-function paperSim(rows) {
+function paperSim(rows, dead) {
+  dead = dead || new Set();                         // v2.9 — CAs the crew filed DEAD (volume gone)
   const byMint = {};                               // one leg per CA (names are copycatted)
   for (const c of rows || []) {
     if (!c || !c.mint || !(Number(c.mc) > 0)) continue;
@@ -619,20 +620,25 @@ function paperSim(rows) {
     if (c.livePct !== null && c.livePct !== undefined && c.t >= m.lt) { m.live = c.livePct; m.lt = c.t; }
     if (!m.name && c.name) m.name = c.name;
   }
-  let pnl = 0, n = 0, wins = 0, openN = 0;
+  let pnl = 0, n = 0, wins = 0, openN = 0, deadClosed = 0;
   const open = [];
   for (const m of Object.values(byMint)) {
     const r = scaleRet(m.peak, m.live);
     pnl += PAPER.unit * r.ret; n++;
     if (r.ret > 0) wins++;
-    if (!r.closed) { openN++; open.push({ mint: m.mint, name: m.name, live: m.live, peak: m.peak, sold: r.sold >= 0.5 ? 1 : 0 }); }
+    // v2.9 (dubski) — a coin the crew filed DEAD (volume gone) STOPS holding. Its
+    // return is unchanged (already marked at the live quote); it just leaves the
+    // HOLDING list so the board can't stack a million zombie bags.
+    const isDead = dead.has(m.mint);
+    if (isDead && !r.closed) deadClosed++;
+    if (!r.closed && !isDead) { openN++; open.push({ mint: m.mint, name: m.name, live: m.live, peak: m.peak, sold: r.sold >= 0.5 ? 1 : 0 }); }
   }
   open.sort((a, b) => (b.live === null ? -1e9 : b.live) - (a.live === null ? -1e9 : a.live));
-  return { version: '2.8', start: PAPER.start, unit: PAPER.unit,
+  return { version: '2.9', start: PAPER.start, unit: PAPER.unit,
     balance: Math.round((PAPER.start + pnl) * 1e4) / 1e4,
     pnl: Math.round(pnl * 1e4) / 1e4, n, wins,
     winRate: n ? Math.round(100 * wins / n) : null,
-    openN, open: open.slice(0, 20), t: Date.now() };
+    openN, open: open.slice(0, 20), deadClosed, t: Date.now() };
 }
 let _paperCache = { at: 0, body: null };            // recompute at most every 4s
 let paperEpoch = 0;   // v2.5 — a crew RESET moves this forward; /paper only sims calls at/after it
@@ -642,7 +648,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.8' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.9' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -672,7 +678,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && u.pathname === '/paper') {
       if (Date.now() - _paperCache.at < 4000 && _paperCache.body) return send(res, 200, _paperCache.body);
       const rows = (await store.board(0, 'recent')).filter(c => !paperEpoch || (Number(c.t) || 0) >= paperEpoch);
-      const body = paperSim(rows);
+      // v2.9 — coins the crew filed DEAD (closed book = volume gone) leave HOLDING
+      let dead = new Set();
+      try { dead = new Set(Object.keys(await store.booksGet('closed', 0, 20000))); } catch (e) {}
+      const body = paperSim(rows, dead);
       body.epoch = paperEpoch;
       _paperCache = { at: Date.now(), body };
       return send(res, 200, body);
@@ -854,7 +863,7 @@ if (require.main === module) {
     // v2.8 — restore the crew paper epoch so a redeploy doesn't silently re-scope
     // the shared balance (it used to live only in RAM and reset to 0 every deploy).
     try { const e = await store.getMeta('paperEpoch'); if (Number(e)) { paperEpoch = Number(e); console.log('[paper] restored epoch ' + paperEpoch); } } catch (err) { console.warn('[paper] epoch restore failed:', err && err.message); }
-    server.listen(PORT, () => console.log('Trench Radar server v2.8 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.9 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
