@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.1
+// Trench Radar — shared calls server v2.4
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -566,12 +566,66 @@ function readBodyOnce(req, cap) {
 }
 const WINDOWS = { '24h': 24 * 3600e3, '7d': 7 * 24 * 3600e3, 'all': 3650 * 24 * 3600e3 };
 
+// ── v2.3 — the crew's SHARED paper balance ──────────────────────────────
+// dubski wanted ONE simulated balance every viewer sees, not a per-machine
+// number. It is deterministic: every crew call is sized 0.25 SOL and run
+// through his SCALE-OUT (sell 1/3 at 2x, 1/3 at 3x, TRAIL the rest and exit if
+// it fell 30% from the peak the crew observed), reconstructed from the peak/
+// live data the bots already push. No price-fetching, no capital cap — a
+// strategy balance, identical for everyone because it is computed here.
+const PAPER = { start: 5, unit: 0.25, cost: 0.03 };
+function scaleRet(peakPct, livePct) {
+  const cost = PAPER.cost;
+  const peak = 1 + (Number(peakPct) || 0) / 100;
+  const haveLive = livePct !== null && livePct !== undefined;
+  const live = haveLive ? 1 + Number(livePct) / 100 : 1;   // no live yet → mark the rest at entry, still OPEN
+  let ret = 0, sold = 0;
+  const clipped = peak >= 2;                        // v2.4 (CC r18 fix) — bank HALF at 2x
+  if (clipped) { ret += 0.5 * (2 - 1 - cost); sold += 0.5; }
+  const rem = 1 - sold;
+  const trail = peak * 0.7;
+  // The trail exists ONLY after the first clip (armed at 2x). A coin that never
+  // hit 2x has NO stop — its remainder stays OPEN at the live quote. That flat
+  // −30%-from-entry stop was the whole loss CC round 18 measured. A missing
+  // quote must never book a trail-win either, so real live data is required.
+  const closed = clipped && haveLive && live <= trail;
+  const exit = closed ? trail : live;
+  ret += rem * (exit - 1 - cost);
+  return { ret, closed, sold };
+}
+function paperSim(rows) {
+  const byMint = {};                               // one leg per CA (names are copycatted)
+  for (const c of rows || []) {
+    if (!c || !c.mint || !(Number(c.mc) > 0)) continue;
+    const m = byMint[c.mint] || (byMint[c.mint] = { mint: c.mint, name: c.name || null, t0: c.t, mc0: c.mc, peak: 0, live: null, lt: -1 });
+    if (c.t < m.t0) { m.t0 = c.t; m.mc0 = c.mc; }  // earliest crew call = the entry
+    if ((c.peakPct || 0) > m.peak) m.peak = c.peakPct || 0;
+    if (c.livePct !== null && c.livePct !== undefined && c.t >= m.lt) { m.live = c.livePct; m.lt = c.t; }
+    if (!m.name && c.name) m.name = c.name;
+  }
+  let pnl = 0, n = 0, wins = 0, openN = 0;
+  const open = [];
+  for (const m of Object.values(byMint)) {
+    const r = scaleRet(m.peak, m.live);
+    pnl += PAPER.unit * r.ret; n++;
+    if (r.ret > 0) wins++;
+    if (!r.closed) { openN++; open.push({ mint: m.mint, name: m.name, live: m.live, peak: m.peak, sold: Math.round(r.sold * 3) }); }
+  }
+  open.sort((a, b) => (b.live === null ? -1e9 : b.live) - (a.live === null ? -1e9 : a.live));
+  return { version: '2.4', start: PAPER.start, unit: PAPER.unit,
+    balance: Math.round((PAPER.start + pnl) * 1e4) / 1e4,
+    pnl: Math.round(pnl * 1e4) / 1e4, n, wins,
+    winRate: n ? Math.round(100 * wins / n) : null,
+    openN, open: open.slice(0, 20), t: Date.now() };
+}
+let _paperCache = { at: 0, body: null };            // recompute at most every 4s
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.2' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.4' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -593,6 +647,17 @@ const server = http.createServer(async (req, res) => {
         shown: all.length, coins: all.slice(0, limit),
         wlBasis: 'every call in the window, deduped by mint — independent of sort',
       });
+    }
+
+    // v2.3 — the crew's SHARED paper balance (same number for everyone). Public
+    // GET like /board; computed from the crew's calls + pushed peak/live, cached
+    // 4s so a room full of bots polling can't hammer the store.
+    if (req.method === 'GET' && u.pathname === '/paper') {
+      if (Date.now() - _paperCache.at < 4000 && _paperCache.body) return send(res, 200, _paperCache.body);
+      const rows = await store.board(0, 'recent');
+      const body = paperSim(rows);
+      _paperCache = { at: Date.now(), body };
+      return send(res, 200, body);
     }
 
     // crew wallet crawl — both PCs pool their top-20 holder snapshots
@@ -758,7 +823,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v2.1 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.4 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
