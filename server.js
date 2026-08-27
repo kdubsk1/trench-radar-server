@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.5
+// Trench Radar — shared calls server v2.6
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -584,12 +584,14 @@ function scaleRet(peakPct, livePct) {
   if (clipped) { ret += 0.5 * (2 - 1 - cost); sold += 0.5; }
   const rem = 1 - sold;
   const trail = peak * 0.7;
-  // The trail exists ONLY after the first clip (armed at 2x). A coin that never
-  // hit 2x has NO stop — its remainder stays OPEN at the live quote. That flat
-  // −30%-from-entry stop was the whole loss CC round 18 measured. A missing
-  // quote must never book a trail-win either, so real live data is required.
-  const closed = clipped && haveLive && live <= trail;
-  const exit = closed ? trail : live;
+  // The trail exists ONLY after the first clip (armed at 2x) — that flat
+  // −30%-from-entry stop was the whole loss CC round 18 measured. BUT a coin
+  // that never 2x'd and is now down ≥60% is a DEAD bag (v2.6, dubski): close it
+  // so it leaves HOLDING and lands on the curve. −60% cuts only coins already
+  // gone, not would-be runners. A missing quote never books a trail-win.
+  const dead = !clipped && haveLive && live <= 0.40;
+  const closed = (clipped && haveLive && live <= trail) || dead;
+  const exit = closed ? (dead ? live : trail) : live;
   ret += rem * (exit - 1 - cost);
   return { ret, closed, sold };
 }
@@ -612,7 +614,7 @@ function paperSim(rows) {
     if (!r.closed) { openN++; open.push({ mint: m.mint, name: m.name, live: m.live, peak: m.peak, sold: r.sold >= 0.5 ? 1 : 0 }); }
   }
   open.sort((a, b) => (b.live === null ? -1e9 : b.live) - (a.live === null ? -1e9 : a.live));
-  return { version: '2.5', start: PAPER.start, unit: PAPER.unit,
+  return { version: '2.6', start: PAPER.start, unit: PAPER.unit,
     balance: Math.round((PAPER.start + pnl) * 1e4) / 1e4,
     pnl: Math.round(pnl * 1e4) / 1e4, n, wins,
     winRate: n ? Math.round(100 * wins / n) : null,
@@ -626,7 +628,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.5' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.6' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -834,7 +836,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v2.5 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.6 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
