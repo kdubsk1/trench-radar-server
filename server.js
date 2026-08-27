@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.7
+// Trench Radar — shared calls server v2.8
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -193,6 +193,9 @@ function memStore() {
       for (const [m, d] of Object.entries(book)) if ((d.t || 0) >= (Number(since) || 0)) out[m] = d;
       return out;
     },
+    // v2.8 — tiny durable KV (the paper epoch must survive a redeploy).
+    async setMeta(key, val) { this._meta = this._meta || {}; this._meta[key] = val; },
+    async getMeta(key) { return (this._meta || {})[key]; },
     async walletsPut(entries) {
       this._wal = this._wal || new Map();
       let n = 0;
@@ -280,6 +283,9 @@ function pgStore() {
         PRIMARY KEY (kind, mint)
       )`);
       await pool.query('CREATE INDEX IF NOT EXISTS books_kind_upd_idx ON books(kind, upd)');
+      // v2.8 — durable KV so the paper epoch survives a redeploy (it was in RAM
+      // and reset to 0 on every deploy, silently re-scoping the crew balance).
+      await pool.query(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`);
     },
     async booksPut(user, kind, rows) {
       let added = 0, merged = 0;
@@ -310,6 +316,16 @@ function pgStore() {
       const out = {};
       for (const row of r.rows) out[row.mint] = Object.assign({}, row.data, { u: (row.data && row.data.u) || row.usr });
       return out;
+    },
+    // v2.8 — durable KV (paper epoch survives a redeploy)
+    async setMeta(key, val) {
+      await pool.query(
+        `INSERT INTO meta (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
+        [key, JSON.stringify(val)]);
+    },
+    async getMeta(key) {
+      const r = await pool.query('SELECT v FROM meta WHERE k = $1', [key]);
+      return r.rows[0] ? JSON.parse(r.rows[0].v) : undefined;
     },
     async upsertCall(c) {
       await pool.query(
@@ -612,7 +628,7 @@ function paperSim(rows) {
     if (!r.closed) { openN++; open.push({ mint: m.mint, name: m.name, live: m.live, peak: m.peak, sold: r.sold >= 0.5 ? 1 : 0 }); }
   }
   open.sort((a, b) => (b.live === null ? -1e9 : b.live) - (a.live === null ? -1e9 : a.live));
-  return { version: '2.7', start: PAPER.start, unit: PAPER.unit,
+  return { version: '2.8', start: PAPER.start, unit: PAPER.unit,
     balance: Math.round((PAPER.start + pnl) * 1e4) / 1e4,
     pnl: Math.round(pnl * 1e4) / 1e4, n, wins,
     winRate: n ? Math.round(100 * wins / n) : null,
@@ -626,7 +642,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.7' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.8' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -714,6 +730,7 @@ const server = http.createServer(async (req, res) => {
       if (u.pathname === '/paper/reset') {
         paperEpoch = Date.now();
         _paperCache = { at: 0, body: null };
+        await store.setMeta('paperEpoch', paperEpoch);   // v2.8 — durable, survives a redeploy
         return send(res, 200, { ok: true, epoch: paperEpoch });
       }
 
@@ -834,7 +851,10 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v2.7 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    // v2.8 — restore the crew paper epoch so a redeploy doesn't silently re-scope
+    // the shared balance (it used to live only in RAM and reset to 0 every deploy).
+    try { const e = await store.getMeta('paperEpoch'); if (Number(e)) { paperEpoch = Number(e); console.log('[paper] restored epoch ' + paperEpoch); } } catch (err) { console.warn('[paper] epoch restore failed:', err && err.message); }
+    server.listen(PORT, () => console.log('Trench Radar server v2.8 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
