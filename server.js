@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.4
+// Trench Radar — shared calls server v2.5
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -609,23 +609,24 @@ function paperSim(rows) {
     const r = scaleRet(m.peak, m.live);
     pnl += PAPER.unit * r.ret; n++;
     if (r.ret > 0) wins++;
-    if (!r.closed) { openN++; open.push({ mint: m.mint, name: m.name, live: m.live, peak: m.peak, sold: Math.round(r.sold * 3) }); }
+    if (!r.closed) { openN++; open.push({ mint: m.mint, name: m.name, live: m.live, peak: m.peak, sold: r.sold >= 0.5 ? 1 : 0 }); }
   }
   open.sort((a, b) => (b.live === null ? -1e9 : b.live) - (a.live === null ? -1e9 : a.live));
-  return { version: '2.4', start: PAPER.start, unit: PAPER.unit,
+  return { version: '2.5', start: PAPER.start, unit: PAPER.unit,
     balance: Math.round((PAPER.start + pnl) * 1e4) / 1e4,
     pnl: Math.round(pnl * 1e4) / 1e4, n, wins,
     winRate: n ? Math.round(100 * wins / n) : null,
     openN, open: open.slice(0, 20), t: Date.now() };
 }
 let _paperCache = { at: 0, body: null };            // recompute at most every 4s
+let paperEpoch = 0;   // v2.5 — a crew RESET moves this forward; /paper only sims calls at/after it
 
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.4' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.5' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -654,8 +655,9 @@ const server = http.createServer(async (req, res) => {
     // 4s so a room full of bots polling can't hammer the store.
     if (req.method === 'GET' && u.pathname === '/paper') {
       if (Date.now() - _paperCache.at < 4000 && _paperCache.body) return send(res, 200, _paperCache.body);
-      const rows = await store.board(0, 'recent');
+      const rows = (await store.board(0, 'recent')).filter(c => !paperEpoch || (Number(c.t) || 0) >= paperEpoch);
       const body = paperSim(rows);
+      body.epoch = paperEpoch;
       _paperCache = { at: Date.now(), body };
       return send(res, 200, body);
     }
@@ -705,6 +707,15 @@ const server = http.createServer(async (req, res) => {
     // writes require the shared key
     if (req.method === 'POST') {
       if ((req.headers['x-radar-key'] || '') !== RADAR_KEY) return send(res, 401, { error: 'bad key' });
+
+      // v2.5 — CREW paper reset. Moves the epoch forward so /paper sims only
+      // calls from now on: everyone's shared balance restarts at 5 SOL together.
+      // No body needed; the key gate above is the auth.
+      if (u.pathname === '/paper/reset') {
+        paperEpoch = Date.now();
+        _paperCache = { at: 0, body: null };
+        return send(res, 200, { ok: true, epoch: paperEpoch });
+      }
 
       // ⚠ ONE READ, AT THE TOP, FOR EVERY POST. Read the note on readBody().
       //
@@ -823,7 +834,7 @@ if (require.main === module) {
   (async () => {
     store = DATABASE_URL ? pgStore() : memStore();
     await store.init();
-    server.listen(PORT, () => console.log('Trench Radar server v2.4 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.5 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
