@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.10
+// Trench Radar — shared calls server v2.12
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -31,8 +31,11 @@ const MAX_INGEST = 3 * 1024 * 1024; // full session payloads (samples/devBook/fe
 // `booksServerOk` latch turned that single 400 into a total sync blackout for
 // EVERY book. Client fixed in v0.88 (per-kind skip), and tests/ship-gate.js
 // now fails the build if the script's SYNC_BOOKS and this list disagree.
+//   meta/tweet capture records (v2.11)  union of fields; a null never overwrites a value;
+//                                       when both sides hold a value the newer `t` wins
+//   fill      human fill log (v2.11)    per side (buy/sell) union, newer side wins; never shed
 const BOOK_KINDS = ['ledger', 'runner', 'closed', 'rug', 'good', 'devban', 'hidden',
-                    'devbook', 'hotwallet', 'wmeta', 'early', 'paper'];
+                    'devbook', 'hotwallet', 'wmeta', 'early', 'paper', 'meta', 'tweet', 'fill'];
 function mergeBook(kind, a, b) {
   if (kind === 'early') {
     // Two PCs watch the same coin from different moments. Neither reading is
@@ -80,6 +83,43 @@ function mergeBook(kind, a, b) {
     if (changed) out.p = p;
     if (b.t && (!a.t || b.t < a.t)) { out.t = b.t; changed = true; }
     if (!a.name && b.name) { out.name = b.name; changed = true; }
+    return changed ? out : null;
+  }
+  if (kind === 'meta' || kind === 'tweet') {
+    // v2.11 CAPTURE records (what the coin IS / what the tweet says). Two PCs fetched
+    // the same thing at different moments: a field one side has and the other lacks
+    // is kept; where both hold a value the NEWER reading (by t) wins, ties resolve
+    // to the lexicographically smaller JSON so order can never matter.
+    const out = { ...a };
+    let changed = false;
+    const at = Number(a.t) || 0, bt = Number(b.t) || 0;
+    const nil = x => x === null || x === undefined;
+    for (const k of Object.keys(b)) {
+      if (k === 'u') continue;
+      const av = a[k], bv = b[k];
+      if (nil(bv)) continue;
+      if (nil(av)) { out[k] = bv; changed = true; continue; }
+      const same = JSON.stringify(av) === JSON.stringify(bv);
+      if (same) continue;
+      if (bt > at || (bt === at && JSON.stringify(bv) < JSON.stringify(av))) { out[k] = bv; changed = true; }
+    }
+    return changed ? out : null;
+  }
+  if (kind === 'fill') {
+    // v2.11 HUMAN fills — dubski typed these. Each side (buy / sell) is a fact:
+    // keep whichever side exists; when both do, the one saved later wins.
+    const out = { ...a };
+    let changed = false;
+    for (const side of ['buy', 'sell']) {
+      const as = a[side] && typeof a[side] === 'object' ? a[side] : null;
+      const bs = b[side] && typeof b[side] === 'object' ? b[side] : null;
+      if (!bs) continue;
+      if (!as) { out[side] = bs; changed = true; continue; }
+      const at = Number(as.t) || 0, bt = Number(bs.t) || 0;
+      if (bt > at || (bt === at && JSON.stringify(bs) < JSON.stringify(as) && JSON.stringify(bs) !== JSON.stringify(as))) { out[side] = bs; changed = true; }
+    }
+    if (!a.name && b.name) { out.name = b.name; changed = true; }
+    if (b.t && (!a.t || b.t < a.t)) { out.t = b.t; changed = true; }
     return changed ? out : null;
   }
   if (kind === 'runner' || kind === 'closed') {
@@ -644,6 +684,52 @@ function paperSim(rows, dead) {
     openN, open: open.slice(0, 20), deadClosed, t: Date.now() };
 }
 let _paperCache = { at: 0, body: null };            // recompute at most every 4s
+
+// ── v2.12 — THE RACE DETECTOR, crew-wide (OI 4.3.3) ─────────────────────────
+// The client sees a race only among coins on ITS list right now. The server has
+// every meta row either PC ever pushed, so it can answer "how many coins launched
+// off this tweet, in what order, and which copy HELD" across sessions. Pure over
+// the books: meta (twId, createdT, nm, sym, creator, tickerInTweet, imgMatch),
+// tweet (author, followers, text), ledger (v = W/L/F). Same key swap = themes.
+function buildRaces(meta, tweets, ledger, opt) {
+  opt = opt || {};
+  const now = opt.now || Date.now();
+  const winMs = (opt.hours || 24) * 3600e3;
+  const minN = opt.min || 2;
+  const byTw = new Map(), byName = new Map();
+  const nameKey = nm => String(nm || '').toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 24);
+  for (const [mint, m] of Object.entries(meta || {})) {
+    if (!m || typeof m !== 'object') continue;
+    const born = Number(m.createdT) || Number(m.t) || 0;
+    if (!born || now - born > winMs) continue;
+    const L = (ledger || {})[mint] || null;
+    const row = { mint, nm: m.nm || null, sym: m.sym || null, createdT: born, creator: m.creator || null,
+      tickerInTweet: m.tickerInTweet === true, imgMatch: m.imgMatch === true, twAgeAtLaunchS: m.twAgeAtLaunchS ?? null,
+      v: L ? L.v || null : null, peak: L && typeof L.peak === 'number' ? L.peak : null, worst: L && typeof L.worst === 'number' ? L.worst : null };
+    if (m.twId) { if (!byTw.has(m.twId)) byTw.set(m.twId, []); byTw.get(m.twId).push(row); }
+    const nk = nameKey(m.nm); if (nk) { if (!byName.has(nk)) byName.set(nk, []); byName.get(nk).push(row); }
+  }
+  const races = [];
+  for (const [twId, g] of byTw) {
+    if (g.length < minN) continue;
+    g.sort((a, b) => a.createdT - b.createdT || a.mint.localeCompare(b.mint));
+    g.forEach((r, i) => { r.rank = i + 1; });
+    const tb = (tweets || {})[twId] || {};
+    races.push({ twId, author: tb.author || null, followers: tb.followers ?? null, text: tb.text ? String(tb.text).slice(0, 140) : null,
+      n: g.length, firstT: g[0].createdT, held: g.filter(r => r.v === 'W').length, rugged: g.filter(r => r.v === 'L').length, copies: g });
+  }
+  races.sort((a, b) => b.firstT - a.firstT);
+  const themes = [];
+  for (const [key, g] of byName) {
+    if (g.length < minN) continue;
+    g.sort((a, b) => a.createdT - b.createdT);
+    themes.push({ key, name: g[0].nm, n: g.length, firstT: g[0].createdT, held: g.filter(r => r.v === 'W').length, rugged: g.filter(r => r.v === 'L').length,
+      mints: g.map(r => r.mint) });
+  }
+  themes.sort((a, b) => b.n - a.n || b.firstT - a.firstT);
+  return { hours: opt.hours || 24, races, themes, t: now };
+}
+let _raceCache = { at: 0, key: '', body: null };
 let paperEpoch = 0;   // v2.5 — a crew RESET moves this forward; /paper only sims calls at/after it
 
 const server = http.createServer(async (req, res) => {
@@ -651,7 +737,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.10' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.12' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -687,6 +773,19 @@ const server = http.createServer(async (req, res) => {
       const body = paperSim(rows, dead);
       body.epoch = paperEpoch;
       _paperCache = { at: Date.now(), body };
+      return send(res, 200, body);
+    }
+
+    // v2.12 — GET /races?hours=24&min=2 — every tweet ≥2 coins launched off, ranked by
+    // launch order, with each copy's ticker/pic match + verdict; plus name themes.
+    if (req.method === 'GET' && u.pathname === '/races') {
+      const hours = Math.min(Math.max(parseInt(u.searchParams.get('hours')) || 24, 1), 24 * 30);
+      const min = Math.min(Math.max(parseInt(u.searchParams.get('min')) || 2, 1), 50);
+      const key = hours + ':' + min;
+      if (_raceCache.key === key && Date.now() - _raceCache.at < 10000 && _raceCache.body) return send(res, 200, _raceCache.body);
+      const [meta, tweets, ledger] = await Promise.all([store.booksGet('meta', 0, 8000), store.booksGet('tweet', 0, 8000), store.booksGet('ledger', 0, 8000)]);
+      const body = buildRaces(meta, tweets, ledger, { hours, min });
+      _raceCache = { at: Date.now(), key, body };
       return send(res, 200, body);
     }
 
@@ -866,8 +965,8 @@ if (require.main === module) {
     // v2.8 — restore the crew paper epoch so a redeploy doesn't silently re-scope
     // the shared balance (it used to live only in RAM and reset to 0 every deploy).
     try { const e = await store.getMeta('paperEpoch'); if (Number(e)) { paperEpoch = Number(e); console.log('[paper] restored epoch ' + paperEpoch); } } catch (err) { console.warn('[paper] epoch restore failed:', err && err.message); }
-    server.listen(PORT, () => console.log('Trench Radar server v2.10 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.12 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
-module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore }; // for offline tests
+module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces }; // for offline tests
