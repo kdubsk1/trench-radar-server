@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.15
+// Trench Radar — shared calls server v2.16
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -35,7 +35,7 @@ const MAX_INGEST = 3 * 1024 * 1024; // full session payloads (samples/devBook/fe
 //                                       when both sides hold a value the newer `t` wins
 //   fill      human fill log (v2.11)    per side (buy/sell) union, newer side wins; never shed
 const BOOK_KINDS = ['ledger', 'runner', 'closed', 'rug', 'good', 'devban', 'hidden',
-                    'devbook', 'hotwallet', 'wmeta', 'early', 'paper', 'meta', 'tweet', 'fill', 'site'];
+                    'devbook', 'hotwallet', 'wmeta', 'early', 'paper', 'meta', 'tweet', 'fill', 'site', 'call', 'ping'];
 function mergeBook(kind, a, b) {
   if (kind === 'early') {
     // Two PCs watch the same coin from different moments. Neither reading is
@@ -94,7 +94,7 @@ function mergeBook(kind, a, b) {
     if (bt > at || (!a.ok && b.ok)) return { ...a, ...b };
     return null;
   }
-  if (kind === 'meta' || kind === 'tweet') {
+  if (kind === 'meta' || kind === 'tweet' || kind === 'ping') {   // v2.16: ping rows are capture records too
     // v2.11 CAPTURE records (what the coin IS / what the tweet says). Two PCs fetched
     // the same thing at different moments: a field one side has and the other lacks
     // is kept; where both hold a value the NEWER reading (by t) wins, ties resolve
@@ -131,7 +131,7 @@ function mergeBook(kind, a, b) {
     if (b.t && (!a.t || b.t < a.t)) { out.t = b.t; changed = true; }
     return changed ? out : null;
   }
-  if (kind === 'runner' || kind === 'closed') {
+  if (kind === 'runner' || kind === 'closed' || kind === 'call') {   // v2.16: the call-time snapshot is a moment too
     // Archives record a MOMENT (hit 2x / died). "First write wins" made the
     // result depend on who happened to push first, so two PCs kept different
     // copies forever. The earliest observation is the true one, with a
@@ -806,6 +806,82 @@ function buildAuthors(tweets, meta, ledger, opt) {
 }
 let _authorCache = { at: 0, key: '', body: null };
 
+// ── v2.16 — THE LEARNING LOOP, on the server (OI 4.8; dubski: "we use the data to get as good
+// as we can get"). Every ping row the clients push carries the call-time features AND every
+// narrative field (tweet, race, dev, chart shape, arrival, stacking, top traders…). Joined to the
+// ledger verdict (HELD = peak ≥ 100 AND worst > −50), each field is split and the HELD rate of each
+// side is read against the base. Numbers: top vs bottom tercile. Booleans: true vs false.
+// Strings (tweetWhy etc.): per value. n on every row — a lead needs n; a gate needs a LOT more.
+// This REPLACES "wait for an export and run scripts/learning-loop.js by hand".
+const LEARN_FIELDS = {
+  num: ['mc', 'vol', 'holders', 'pro', 'top10', 'snipers', 'tw', 'age', 'conv', 'velVol', 'velHold', 'vm5', 'liq', 'volMc',
+        'watch', 'watchVel', 'seenAgoMs', 'twAgeMin', 'twFollowers', 'raceN', 'raceRank', 'themeN', 'devCoins', 'devRunners', 'devRugs',
+        'dip1m', 'rebound60s', 'hl5m', 'harr1m', 'harr2m', 'harr5m', 'replyVel', 'replyN5m', 'stackN', 'stackVel', 'stackN0', 'ttMedBuyMc', 'ttEntryRatio', 'ttInProfit'],
+  bool: ['raceLeader', 'twOnList', 'devFirst', 'survivedDump', 'aboveSeen2m', 'greenRising1m', 'greenRising2m', 'seenBefore'],
+  // lane flags are written `true : undefined` on the ping row — for THESE, missing means "did not
+  // fire" (false). For every other boolean, missing means "not computed yet" and is excluded.
+  flag: ['fast', 'tweet'],
+  str: ['tweetWhy', 'site', 'col'],
+};
+function heldOf(L) {
+  if (!L) return null;
+  const peak = typeof L.peak === 'number' ? L.peak : null, worst = typeof L.worst === 'number' ? L.worst : null;
+  if (peak === null && !L.v) return null;
+  if (peak === null) return L.v === 'W' ? null : false;   // legacy W without a peak: unknown whether it HELD
+  return peak >= 100 && (worst === null || worst > -50);
+}
+function buildLearn(pings, ledger, meta, tweets, sites, opt) {
+  opt = opt || {};
+  const minN = opt.min || 8;
+  const rows = [];
+  for (const [mint, p] of Object.entries(pings || {})) {
+    if (!p || typeof p !== 'object') continue;
+    const held = heldOf((ledger || {})[mint]);
+    if (held === null) continue;
+    const m = (meta || {})[mint] || {}, tb = m.twId ? (tweets || {})[m.twId] || {} : {}, st = (sites || {})[mint] || {};
+    rows.push(Object.assign({}, p, {
+      _held: held,
+      // narrative fields that live on OTHER books, joined in
+      tickerInTweet: m.tickerInTweet, imgMatch: m.imgMatch, cashback: m.cashback, nameSeenN: m.nameSeenN, twAgeAtLaunchS: m.twAgeAtLaunchS,
+      twViews: tb.views, twLikes: tb.likes, hasCommunity: !!(m.xCommunity || p.xCommunity), hasSite: !!m.webUrl,
+      siteHasCA: st.ok ? st.hasCA : undefined, siteJs: st.ok ? st.jsRendered : undefined,
+    }));
+  }
+  const n = rows.length, heldN = rows.filter(r => r._held).length;
+  const base = n ? heldN / n : null;
+  const pct = (a, b) => b ? Math.round(1000 * a / b) / 10 : null;
+  const out = [];
+  const numFields = LEARN_FIELDS.num.concat(['nameSeenN', 'twAgeAtLaunchS', 'twViews', 'twLikes']);
+  const boolFields = LEARN_FIELDS.bool.concat(['tickerInTweet', 'imgMatch', 'cashback', 'hasCommunity', 'hasSite', 'siteHasCA', 'siteJs']);
+  for (const f of numFields) {
+    const have = rows.filter(r => typeof r[f] === 'number' && isFinite(r[f])).sort((a, b) => a[f] - b[f]);
+    if (have.length < minN * 2) { out.push({ field: f, kind: 'num', n: have.length, thin: true }); continue; }
+    const k = Math.floor(have.length / 3);
+    const lo = have.slice(0, k), hi = have.slice(have.length - k);
+    const loR = pct(lo.filter(r => r._held).length, lo.length), hiR = pct(hi.filter(r => r._held).length, hi.length);
+    out.push({ field: f, kind: 'num', n: have.length, lo: { n: lo.length, max: lo[lo.length - 1][f], held: loR }, hi: { n: hi.length, min: hi[0][f], held: hiR },
+      lift: hiR !== null && loR !== null ? Math.round(10 * (hiR - loR)) / 10 : null, thin: k < minN });
+  }
+  for (const f of boolFields.concat(LEARN_FIELDS.flag)) {
+    const isFlag = LEARN_FIELDS.flag.includes(f);
+    const have = isFlag ? rows.map(r => Object.assign({}, r, { [f]: r[f] === true })) : rows.filter(r => typeof r[f] === 'boolean');
+    const T = have.filter(r => r[f]), F = have.filter(r => !r[f]);
+    if (!have.length) { out.push({ field: f, kind: 'bool', n: 0, thin: true }); continue; }
+    const tR = pct(T.filter(r => r._held).length, T.length), fR = pct(F.filter(r => r._held).length, F.length);
+    out.push({ field: f, kind: 'bool', n: have.length, true: { n: T.length, held: tR }, false: { n: F.length, held: fR },
+      lift: tR !== null && fR !== null ? Math.round(10 * (tR - fR)) / 10 : null, thin: T.length < minN || F.length < minN });
+  }
+  for (const f of LEARN_FIELDS.str) {
+    const by = {};
+    for (const r of rows) { const v = r[f]; if (v === null || v === undefined || v === '') continue; const k = String(v).slice(0, 24); (by[k] = by[k] || []).push(r); }
+    const vals = Object.entries(by).map(([v, rs]) => ({ v, n: rs.length, held: pct(rs.filter(r => r._held).length, rs.length) })).sort((a, b) => b.n - a.n).slice(0, 12);
+    if (vals.length) out.push({ field: f, kind: 'str', n: rows.filter(r => r[f] !== null && r[f] !== undefined && r[f] !== '').length, values: vals, thin: vals.every(x => x.n < minN) });
+  }
+  out.sort((a, b) => (b.thin ? 0 : Math.abs(b.lift || 0)) - (a.thin ? 0 : Math.abs(a.lift || 0)));
+  return { n, held: heldN, base: base !== null ? Math.round(1000 * base) / 10 : null, minN, fields: out, t: Date.now() };
+}
+let _learnCache = { at: 0, key: '', body: null };
+
 // ── v2.13 — THE SITE SCANNER (OI 4.3.4) ────────────────────────────────────
 // dubski's tell: a real coin links a site, and a real site shows the CA / says what the
 // coin IS. The CLIENT cannot do this — measured in his own browser 2026-09-02, every one
@@ -896,7 +972,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.15' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.16' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -932,6 +1008,17 @@ const server = http.createServer(async (req, res) => {
       const body = paperSim(rows, dead);
       body.epoch = paperEpoch;
       _paperCache = { at: Date.now(), body };
+      return send(res, 200, body);
+    }
+
+    // v2.16 — GET /learn?min=8 — every captured field split against HELD, ranked by |lift|.
+    if (req.method === 'GET' && u.pathname === '/learn') {
+      const min = Math.min(Math.max(parseInt(u.searchParams.get('min')) || 8, 2), 200);
+      const key = String(min);
+      if (_learnCache.key === key && Date.now() - _learnCache.at < 20000 && _learnCache.body) return send(res, 200, _learnCache.body);
+      const [pings, ledger, meta, tweets, sites] = await Promise.all([store.booksGet('ping', 0, 8000), store.booksGet('ledger', 0, 8000), store.booksGet('meta', 0, 8000), store.booksGet('tweet', 0, 8000), store.booksGet('site', 0, 8000)]);
+      const body = buildLearn(pings, ledger, meta, tweets, sites, { min });
+      _learnCache = { at: Date.now(), key, body };
       return send(res, 200, body);
     }
 
@@ -1155,8 +1242,8 @@ if (require.main === module) {
     // the shared balance (it used to live only in RAM and reset to 0 every deploy).
     try { const e = await store.getMeta('paperEpoch'); if (Number(e)) { paperEpoch = Number(e); console.log('[paper] restored epoch ' + paperEpoch); } } catch (err) { console.warn('[paper] epoch restore failed:', err && err.message); }
     setInterval(() => { siteTick().catch(e => console.warn('[site] ' + (e && e.message))); }, 5000);   // v2.13
-    server.listen(PORT, () => console.log('Trench Radar server v2.15 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.16 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
-module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces, scanSiteHtml, buildAuthors, isCoinSite }; // for offline tests
+module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces, scanSiteHtml, buildAuthors, isCoinSite, buildLearn, heldOf }; // for offline tests
