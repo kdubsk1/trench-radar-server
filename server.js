@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.14
+// Trench Radar — shared calls server v2.15
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -242,6 +242,9 @@ function memStore() {
       for (const [m, d] of Object.entries(book)) if ((d.t || 0) >= (Number(since) || 0)) out[m] = d;
       return out;
     },
+    // v2.15 — repair primitives: REPLACE a row (bypassing merge — repairs only) and DELETE a row
+    async booksSet(kind, mint, data) { this._books = this._books || {}; const b = this._books[kind] = this._books[kind] || {}; if (!b[mint]) return 0; b[mint] = data; return 1; },
+    async booksDelete(kind, mint) { const b = (this._books || {})[kind]; if (!b || !b[mint]) return 0; delete b[mint]; return 1; },
     // v2.8 — tiny durable KV (the paper epoch must survive a redeploy).
     async setMeta(key, val) { this._meta = this._meta || {}; this._meta[key] = val; },
     async getMeta(key) { return (this._meta || {})[key]; },
@@ -357,6 +360,15 @@ function pgStore() {
         }
       }
       return { added, merged };
+    },
+    // v2.15 — repair primitives (bypass merge on purpose; only /repair routes call them)
+    async booksSet(kind, mint, data) {
+      const r = await pool.query('UPDATE books SET data=$1, upd=$2 WHERE kind=$3 AND mint=$4', [JSON.stringify(data), Date.now(), kind, mint]);
+      return r.rowCount;
+    },
+    async booksDelete(kind, mint) {
+      const r = await pool.query('DELETE FROM books WHERE kind=$1 AND mint=$2', [kind, mint]);
+      return r.rowCount;
     },
     async booksGet(kind, since, limit) {
       const r = await pool.query(
@@ -829,6 +841,33 @@ async function fetchSite(url, ms) {
   } catch (e) { return { status: 0, err: String((e && e.message) || e).slice(0, 60) }; }
   finally { clearTimeout(killer); }
 }
+// v2.15 — the server's copy of the client's isCoinSite (v1.33.0). The client stopped storing
+// these hosts as coin websites; rows pushed BEFORE that fix still carry them. /repair/weburl
+// nulls the field and drops the junk site scan so the scanner never fetches them again.
+// Keep this list in lockstep with PADRE_CHROME_HOSTS in trench-radar.user.js (t111 asserts).
+const CHROME_HOSTS = /(^|\.)(pump\.fun|pump\.mypinata\.cloud|padre\.gg|otcdesks\.cash|solscan\.io|explorer\.solana\.com|solana\.fm|solanabeach\.io|xray\.helius\.xyz|dexscreener\.com|dextools\.io|birdeye\.so|gmgn\.ai|axiom\.trade|bullx\.io|neo\.bullx\.io|photon-sol\.tinyastro\.io|jup\.ag|rugcheck\.xyz|tradingview\.com|x\.com|twitter\.com|t\.me|telegram\.me)$/i;
+function isCoinSite(u) {
+  const m = String(u || '').match(/^https?:\/\/([^\/?#]+)/i);
+  if (!m) return false;
+  return !CHROME_HOSTS.test(m[1].toLowerCase().replace(/^www\./, ''));
+}
+async function repairWebUrl(dry) {
+  const meta = await store.booksGet('meta', 0, 8000);
+  const out = { checked: 0, polluted: 0, repaired: 0, sitesDropped: 0, examples: [] };
+  for (const [mint, m] of Object.entries(meta)) {
+    if (!m || typeof m !== 'object') continue;
+    out.checked++;
+    if (!m.webUrl || isCoinSite(m.webUrl)) continue;
+    out.polluted++;
+    if (out.examples.length < 8) out.examples.push({ mint: mint.slice(0, 8), webUrl: String(m.webUrl).slice(0, 60) });
+    if (dry) continue;
+    const fixed = Object.assign({}, m, { webUrl: null, webUrlPurged: String(m.webUrl).slice(0, 120), webUrlPurgedT: Date.now() });
+    delete fixed.u;
+    out.repaired += await store.booksSet('meta', mint, fixed);
+    out.sitesDropped += await store.booksDelete('site', mint);
+  }
+  return out;
+}
 let siteBusy = false, siteLastRun = 0;
 async function siteTick() {
   if (siteBusy || typeof fetch !== 'function') return;
@@ -839,6 +878,7 @@ async function siteTick() {
     const done = await store.booksGet('site', 0, 8000);
     for (const [mint, m] of Object.entries(meta)) {
       if (!m || !m.webUrl || done[mint]) continue;
+      if (!isCoinSite(m.webUrl)) continue;   // v2.15 — never scan Padre/pump chrome as a "site"
       const r = await fetchSite(m.webUrl, 8000);
       const row = { t: Date.now(), url: String(m.webUrl).slice(0, 200), ok: r.status >= 200 && r.status < 400,
         status: r.status, err: r.err || null };
@@ -856,7 +896,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.14' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.15' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -1010,6 +1050,14 @@ const server = http.createServer(async (req, res) => {
 
       // full session archive — the bot auto-uploads EVERYTHING here every 30min
       // v2.2 #135 — a locally repaired peak REPLACES the server's number
+      // v2.15 — POST /repair/weburl[?dry=1] — one-shot hygiene for pre-v1.33 rows. Key-gated
+      // like every write. dry=1 only counts. Nothing else is touched; the original url is kept
+      // in webUrlPurged so nothing is lost, just moved out of the field the analysis reads.
+      if (u.pathname === '/repair/weburl') {
+        const dry = u.searchParams.get('dry') === '1';
+        const r = await repairWebUrl(dry);
+        return send(res, 200, { ok: true, dry, ...r });
+      }
       if (u.pathname === '/fixpeak') {
         if (!body.mint || typeof body.peakPct !== 'number' || !isFinite(body.peakPct)) {
           return send(res, 400, { error: 'need mint + numeric peakPct' });
@@ -1107,8 +1155,8 @@ if (require.main === module) {
     // the shared balance (it used to live only in RAM and reset to 0 every deploy).
     try { const e = await store.getMeta('paperEpoch'); if (Number(e)) { paperEpoch = Number(e); console.log('[paper] restored epoch ' + paperEpoch); } } catch (err) { console.warn('[paper] epoch restore failed:', err && err.message); }
     setInterval(() => { siteTick().catch(e => console.warn('[site] ' + (e && e.message))); }, 5000);   // v2.13
-    server.listen(PORT, () => console.log('Trench Radar server v2.14 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.15 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
-module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces, scanSiteHtml, buildAuthors }; // for offline tests
+module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces, scanSiteHtml, buildAuthors, isCoinSite }; // for offline tests
