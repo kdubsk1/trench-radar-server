@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.12
+// Trench Radar — shared calls server v2.13
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -35,7 +35,7 @@ const MAX_INGEST = 3 * 1024 * 1024; // full session payloads (samples/devBook/fe
 //                                       when both sides hold a value the newer `t` wins
 //   fill      human fill log (v2.11)    per side (buy/sell) union, newer side wins; never shed
 const BOOK_KINDS = ['ledger', 'runner', 'closed', 'rug', 'good', 'devban', 'hidden',
-                    'devbook', 'hotwallet', 'wmeta', 'early', 'paper', 'meta', 'tweet', 'fill'];
+                    'devbook', 'hotwallet', 'wmeta', 'early', 'paper', 'meta', 'tweet', 'fill', 'site'];
 function mergeBook(kind, a, b) {
   if (kind === 'early') {
     // Two PCs watch the same coin from different moments. Neither reading is
@@ -84,6 +84,15 @@ function mergeBook(kind, a, b) {
     if (b.t && (!a.t || b.t < a.t)) { out.t = b.t; changed = true; }
     if (!a.name && b.name) { out.name = b.name; changed = true; }
     return changed ? out : null;
+  }
+  if (kind === 'site') {
+    // v2.13 SITE SCAN — the server fetched the coin's website (the browser CANNOT: measured
+    // 2026-09-02, 4/4 real coin sites blocked by CORS from the Padre origin). Newest scan of a
+    // given url wins; a scan that errored never overwrites one that succeeded.
+    const at = Number(a.t) || 0, bt = Number(b.t) || 0;
+    if (a.ok && !b.ok) return null;
+    if (bt > at || (!a.ok && b.ok)) return { ...a, ...b };
+    return null;
   }
   if (kind === 'meta' || kind === 'tweet') {
     // v2.11 CAPTURE records (what the coin IS / what the tweet says). Two PCs fetched
@@ -730,6 +739,62 @@ function buildRaces(meta, tweets, ledger, opt) {
   return { hours: opt.hours || 24, races, themes, t: now };
 }
 let _raceCache = { at: 0, key: '', body: null };
+
+// ── v2.13 — THE SITE SCANNER (OI 4.3.4) ────────────────────────────────────
+// dubski's tell: a real coin links a site, and a real site shows the CA / says what the
+// coin IS. The CLIENT cannot do this — measured in his own browser 2026-09-02, every one
+// of 4 coin sites failed CORS from the Padre origin. The server has no such limit.
+// It walks the meta book, fetches each unseen webUrl once, and stores what it found in
+// the `site` book, which the client pulls back like any other book. $0, off the hot path,
+// one site at a time, hard timeout, and a failure is RECORDED (never retried forever).
+const SITE_WORDS = ['charity', 'donate', 'donation', 'cashback', 'airdrop', 'presale', 'whitepaper',
+  'roadmap', 'official', 'audit', 'burn', 'staking', 'nft', 'game', 'dao', 'foundation'];
+function scanSiteHtml(html, mint) {
+  const text = String(html || '');
+  const low = text.toLowerCase();
+  const out = {
+    bytes: text.length,
+    hasCA: mint ? low.indexOf(String(mint).toLowerCase()) >= 0 : null,
+    title: (text.match(/<title[^>]*>([^<]{0,120})/i) || [, ''])[1].trim() || null,
+    words: SITE_WORDS.filter(w => low.indexOf(w) >= 0),
+    xLinks: [...new Set((text.match(/https?:\/\/(?:x|twitter)\.com\/[A-Za-z0-9_]{1,15}/gi) || []).map(u => u.toLowerCase()))].slice(0, 5),
+    // a site whose whole body is a script bundle told us nothing — say so instead of
+    // recording a false "no CA"
+    jsRendered: text.length > 0 && low.replace(/<script[\s\S]*?<\/script>/g, '').replace(/<[^>]+>/g, '').trim().length < 200,
+  };
+  return out;
+}
+async function fetchSite(url, ms) {
+  const ac = new AbortController();
+  const killer = setTimeout(() => ac.abort(), ms || 8000);
+  try {
+    const r = await fetch(url, { signal: ac.signal, redirect: 'follow',
+      headers: { 'user-agent': 'Mozilla/5.0 (compatible; TrenchRadar/2.13)' } });
+    const body = (await r.text()).slice(0, 400000);
+    return { status: r.status, body };
+  } catch (e) { return { status: 0, err: String((e && e.message) || e).slice(0, 60) }; }
+  finally { clearTimeout(killer); }
+}
+let siteBusy = false, siteLastRun = 0;
+async function siteTick() {
+  if (siteBusy || typeof fetch !== 'function') return;
+  if (Date.now() - siteLastRun < 3000) return;
+  siteBusy = true; siteLastRun = Date.now();
+  try {
+    const meta = await store.booksGet('meta', 0, 8000);
+    const done = await store.booksGet('site', 0, 8000);
+    for (const [mint, m] of Object.entries(meta)) {
+      if (!m || !m.webUrl || done[mint]) continue;
+      const r = await fetchSite(m.webUrl, 8000);
+      const row = { t: Date.now(), url: String(m.webUrl).slice(0, 200), ok: r.status >= 200 && r.status < 400,
+        status: r.status, err: r.err || null };
+      if (row.ok) Object.assign(row, scanSiteHtml(r.body, mint));
+      await store.booksPut('server', 'site', { [mint]: row });
+      break;                                  // ONE site per tick — never a burst
+    }
+  } catch (e) { console.warn('[site] ' + (e && e.message)); }
+  finally { siteBusy = false; }
+}
 let paperEpoch = 0;   // v2.5 — a crew RESET moves this forward; /paper only sims calls at/after it
 
 const server = http.createServer(async (req, res) => {
@@ -737,7 +802,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.12' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.13' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -774,6 +839,16 @@ const server = http.createServer(async (req, res) => {
       body.epoch = paperEpoch;
       _paperCache = { at: Date.now(), body };
       return send(res, 200, body);
+    }
+
+    // v2.13 — GET /sites?limit=200 — what the scanner found (also readable via /books?kind=site)
+    if (req.method === 'GET' && u.pathname === '/sites') {
+      const rows = await store.booksGet('site', Number(u.searchParams.get('since')) || 0,
+        Math.min(Math.max(parseInt(u.searchParams.get('limit')) || 200, 1), 2000));
+      const vals = Object.values(rows);
+      return send(res, 200, { count: vals.length,
+        ok: vals.filter(r => r.ok).length, withCA: vals.filter(r => r.hasCA).length,
+        jsRendered: vals.filter(r => r.jsRendered).length, rows });
     }
 
     // v2.12 — GET /races?hours=24&min=2 — every tweet ≥2 coins launched off, ranked by
@@ -965,8 +1040,9 @@ if (require.main === module) {
     // v2.8 — restore the crew paper epoch so a redeploy doesn't silently re-scope
     // the shared balance (it used to live only in RAM and reset to 0 every deploy).
     try { const e = await store.getMeta('paperEpoch'); if (Number(e)) { paperEpoch = Number(e); console.log('[paper] restored epoch ' + paperEpoch); } } catch (err) { console.warn('[paper] epoch restore failed:', err && err.message); }
-    server.listen(PORT, () => console.log('Trench Radar server v2.12 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    setInterval(() => { siteTick().catch(e => console.warn('[site] ' + (e && e.message))); }, 5000);   // v2.13
+    server.listen(PORT, () => console.log('Trench Radar server v2.13 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
-module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces }; // for offline tests
+module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces, scanSiteHtml }; // for offline tests
