@@ -1,4 +1,4 @@
-// Trench Radar — shared calls server v2.13
+// Trench Radar — shared calls server v2.14
 // Both bots (dubski + Tony) POST their calls here; everyone GETs the merged
 // leaderboard with 24h / 7d / all-time best-call windows.
 // Persistence: Postgres if DATABASE_URL is set, else in-memory (dev/testing).
@@ -740,6 +740,60 @@ function buildRaces(meta, tweets, ledger, opt) {
 }
 let _raceCache = { at: 0, key: '', body: null };
 
+// ── v2.14 — THE TWEET-AUTHOR LEADERBOARD (dubski: "I don't follow the best accounts or know
+// them — we should be able to FIND key accounts"). We can: every coin we called that linked
+// a tweet knows its author (tweet book) and its outcome (ledger). So rank authors by what the
+// coins launched off their tweets actually DID. HELD = peak ≥ 100 AND worst > −50 (the honest
+// runner), touched2x = peak ≥ 100 (68% of those round-trip). Base rate = the same over every
+// tweet-linked coin, so an author's lift is read against it, not against zero. n is shown
+// on every row — a 2-for-2 author is a lead, not a gate.
+function buildAuthors(tweets, meta, ledger, opt) {
+  opt = opt || {};
+  const minCoins = opt.min || 1;
+  const byAuthor = new Map();
+  let baseN = 0, baseHeld = 0, base2x = 0;
+  const outcome = mint => {
+    const L = (ledger || {})[mint]; if (!L) return null;
+    const peak = typeof L.peak === 'number' ? L.peak : null, worst = typeof L.worst === 'number' ? L.worst : null;
+    return { t2x: L.v === 'W' || (peak !== null && peak >= 100), held: peak !== null && peak >= 100 && (worst === null || worst > -50), rug: L.v === 'L', peak, worst };
+  };
+  for (const [mint, m] of Object.entries(meta || {})) {
+    if (!m || !m.twId) continue;
+    const tb = (tweets || {})[m.twId];
+    const author = (tb && tb.author) || m.xHandle || null;
+    if (!author) continue;
+    const o = outcome(mint);
+    const a = byAuthor.get(author) || { author, coins: 0, tweets: new Set(), followers: null, held: 0, t2x: 0, rug: 0, scored: 0, bestPeak: null, firstT: null, lastT: null, mints: [] };
+    a.coins++; a.tweets.add(m.twId); a.mints.push(mint);
+    if (tb && tb.followers !== null && tb.followers !== undefined) a.followers = Math.max(a.followers || 0, Number(tb.followers) || 0);
+    const t = Number(m.createdT) || Number(m.t) || 0;
+    if (t) { a.firstT = a.firstT === null ? t : Math.min(a.firstT, t); a.lastT = a.lastT === null ? t : Math.max(a.lastT, t); }
+    if (o) {
+      a.scored++; baseN++;
+      if (o.held) { a.held++; baseHeld++; }
+      if (o.t2x) { a.t2x++; base2x++; }
+      if (o.rug) a.rug++;
+      if (o.peak !== null && (a.bestPeak === null || o.peak > a.bestPeak)) a.bestPeak = o.peak;
+    }
+    byAuthor.set(author, a);
+  }
+  const base = { n: baseN, heldRate: baseN ? baseHeld / baseN : null, t2xRate: baseN ? base2x / baseN : null };
+  const rows = [];
+  for (const a of byAuthor.values()) {
+    if (a.coins < minCoins) continue;
+    rows.push({ author: a.author, coins: a.coins, tweets: a.tweets.size, followers: a.followers, scored: a.scored,
+      held: a.held, t2x: a.t2x, rug: a.rug,
+      heldRate: a.scored ? Math.round(1000 * a.held / a.scored) / 10 : null,
+      t2xRate: a.scored ? Math.round(1000 * a.t2x / a.scored) / 10 : null,
+      lift: a.scored && base.heldRate !== null ? Math.round(1000 * (a.held / a.scored - base.heldRate)) / 10 : null,
+      bestPeak: a.bestPeak, firstT: a.firstT, lastT: a.lastT, mints: a.mints.slice(0, 20) });
+  }
+  rows.sort((x, y) => y.held - x.held || y.t2x - x.t2x || y.coins - x.coins || String(x.author).localeCompare(String(y.author)));
+  return { base: { n: base.n, heldRate: base.heldRate !== null ? Math.round(1000 * base.heldRate) / 10 : null, t2xRate: base.t2xRate !== null ? Math.round(1000 * base.t2xRate) / 10 : null },
+    authors: rows, t: Date.now() };
+}
+let _authorCache = { at: 0, key: '', body: null };
+
 // ── v2.13 — THE SITE SCANNER (OI 4.3.4) ────────────────────────────────────
 // dubski's tell: a real coin links a site, and a real site shows the CA / says what the
 // coin IS. The CLIENT cannot do this — measured in his own browser 2026-09-02, every one
@@ -802,7 +856,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return send(res, 204, {});
     const u = new URL(req.url, 'http://x');
 
-    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.13' });
+    if (req.method === 'GET' && u.pathname === '/health') return send(res, 200, { ok: true, store: DATABASE_URL ? 'pg' : 'mem', version: '2.14' });
 
     if (req.method === 'GET' && u.pathname === '/stats') return send(res, 200, await store.stats());
 
@@ -838,6 +892,18 @@ const server = http.createServer(async (req, res) => {
       const body = paperSim(rows, dead);
       body.epoch = paperEpoch;
       _paperCache = { at: Date.now(), body };
+      return send(res, 200, body);
+    }
+
+    // v2.14 — GET /authors?min=1 — which X accounts do our called coins launch off, and what did
+    // those coins DO. The auto-discovered "key accounts" list, measured against the base rate.
+    if (req.method === 'GET' && u.pathname === '/authors') {
+      const min = Math.min(Math.max(parseInt(u.searchParams.get('min')) || 1, 1), 50);
+      const key = String(min);
+      if (_authorCache.key === key && Date.now() - _authorCache.at < 10000 && _authorCache.body) return send(res, 200, _authorCache.body);
+      const [tweets, meta, ledger] = await Promise.all([store.booksGet('tweet', 0, 8000), store.booksGet('meta', 0, 8000), store.booksGet('ledger', 0, 8000)]);
+      const body = buildAuthors(tweets, meta, ledger, { min });
+      _authorCache = { at: Date.now(), key, body };
       return send(res, 200, body);
     }
 
@@ -1041,8 +1107,8 @@ if (require.main === module) {
     // the shared balance (it used to live only in RAM and reset to 0 every deploy).
     try { const e = await store.getMeta('paperEpoch'); if (Number(e)) { paperEpoch = Number(e); console.log('[paper] restored epoch ' + paperEpoch); } } catch (err) { console.warn('[paper] epoch restore failed:', err && err.message); }
     setInterval(() => { siteTick().catch(e => console.warn('[site] ' + (e && e.message))); }, 5000);   // v2.13
-    server.listen(PORT, () => console.log('Trench Radar server v2.13 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
+    server.listen(PORT, () => console.log('Trench Radar server v2.14 on :' + PORT + ' (' + (DATABASE_URL ? 'postgres' : 'memory') + ')'));
   })();
 }
 
-module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces, scanSiteHtml }; // for offline tests
+module.exports = { shapeBoard, dedupeCoins, dedupeRecent, computeWL, memStore, buildRaces, scanSiteHtml, buildAuthors }; // for offline tests
